@@ -120,7 +120,7 @@ const App: React.FC = () => {
   const deleteHistoryItem = (e: React.MouseEvent, id: string) => {
     // CRITICAL: Stop propagation immediately to prevent opening the item
     e.stopPropagation();
-    e.preventDefault(); 
+    // No need for preventDefault on div clicks, but useful for buttons
     
     if (!window.confirm("Are you sure you want to delete this analysis permanently?")) return;
     
@@ -383,9 +383,9 @@ const App: React.FC = () => {
                    <div 
                       key={item.id}
                       onClick={() => restoreHistoryItem(item)}
-                      className="group relative flex items-center justify-between p-4 bg-white border border-slate-200 rounded-xl hover:border-blue-300 hover:shadow-md transition-all cursor-pointer text-left overflow-hidden"
+                      className="group relative flex items-center justify-between p-4 bg-white border border-slate-200 rounded-xl hover:border-blue-300 hover:shadow-md transition-all cursor-pointer text-left overflow-hidden pr-14"
                    >
-                     <div className="flex items-center gap-3 overflow-hidden pr-8">
+                     <div className="flex items-center gap-3 overflow-hidden">
                         <div className="w-10 h-10 bg-blue-50 text-blue-600 rounded-lg flex-shrink-0 flex items-center justify-center">
                           <i className="fas fa-file-alt"></i>
                         </div>
@@ -395,13 +395,16 @@ const App: React.FC = () => {
                         </div>
                      </div>
                      
-                     {/* Hover Arrow (moves when hovered) */}
-                     <i className="fas fa-arrow-right absolute right-4 text-slate-300 group-hover:text-blue-500 transition-all transform -translate-x-2 opacity-0 group-hover:opacity-100 group-hover:translate-x-0 z-0"></i>
+                     {/* Hover Arrow (Enter Key) - Centered Vertically */}
+                     <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center justify-center">
+                        <i className="fas fa-arrow-right text-slate-300 group-hover:text-blue-500 transition-all transform -translate-x-2 opacity-0 group-hover:opacity-100 group-hover:translate-x-0 z-0"></i>
+                     </div>
                      
-                     {/* Delete Button (Always on top) */}
+                     {/* Delete Button (Top Right Corner) - High Z-Index and Type Button */}
                      <button
+                        type="button"
                         onClick={(e) => deleteHistoryItem(e, item.id)}
-                        className="absolute right-2 top-2 p-2 bg-white/80 hover:bg-red-50 text-slate-300 hover:text-red-500 rounded-full transition-all opacity-0 group-hover:opacity-100 z-20"
+                        className="absolute right-1 top-1 p-2 bg-white/90 hover:bg-red-50 text-slate-300 hover:text-red-500 rounded-lg transition-all opacity-0 group-hover:opacity-100 z-50 shadow-sm"
                         title="Delete record"
                      >
                         <i className="fas fa-trash-alt"></i>
@@ -534,9 +537,9 @@ const App: React.FC = () => {
                              <div 
                                key={item.id} 
                                onClick={() => restoreHistoryItem(item)}
-                               className={`group relative p-3 rounded-lg border transition-all cursor-pointer flex items-center justify-between overflow-hidden ${currentHistoryId === item.id ? 'bg-blue-50 border-blue-200 shadow-inner' : 'bg-white border-slate-100 hover:border-blue-200 hover:bg-slate-50'}`}
+                               className={`group relative p-3 rounded-lg border transition-all cursor-pointer flex items-center justify-between overflow-hidden pr-10 ${currentHistoryId === item.id ? 'bg-blue-50 border-blue-200 shadow-inner' : 'bg-white border-slate-100 hover:border-blue-200 hover:bg-slate-50'}`}
                              >
-                                <div className="min-w-0 pr-8 z-0">
+                                <div className="min-w-0 z-0">
                                    <div className={`text-sm font-medium truncate ${currentHistoryId === item.id ? 'text-blue-800' : 'text-slate-700'}`}>
                                       {item.title}
                                    </div>
@@ -546,8 +549,9 @@ const App: React.FC = () => {
                                 </div>
                                 
                                 <button 
+                                  type="button"
                                   onClick={(e) => deleteHistoryItem(e, item.id)}
-                                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-full transition-all z-20"
+                                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-full transition-all z-50"
                                   title="Delete from history"
                                 >
                                    <i className="fas fa-trash-alt"></i>
