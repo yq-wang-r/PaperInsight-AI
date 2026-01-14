@@ -1,0 +1,5 @@
+{
+  "name": "PaperInsight AI",
+  "description": "An intelligent research assistant that retrieves, reads, and critically analyzes Computer Science papers using Gemini 2.0 Flash.",
+  "requestFramePermissions": []
+}
