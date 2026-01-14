@@ -1,5 +1,5 @@
 import { GoogleGenAI, Tool } from "@google/genai";
-import { AnalysisResult, ChatMessage } from "../types";
+import { AnalysisResult, ChatMessage, HistoryItem } from "../types";
 
 const SYSTEM_INSTRUCTION = `
 Role: 你是一位计算机领域的资深科研助手，擅长快速解析学术论文并提取核心逻辑。
@@ -127,6 +127,92 @@ export const askFollowUp = async (
 
   } catch (error) {
     console.error("Follow-up Error:", error);
+    throw error;
+  }
+};
+
+export const analyzeTrendsWithGemini = async (history: HistoryItem[]): Promise<string> => {
+  if (!process.env.API_KEY) {
+    throw new Error("API Key is missing.");
+  }
+
+  if (history.length === 0) {
+     return "No history available to analyze.";
+  }
+
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+  // Prepare the context from history
+  let aggregatedContext = "";
+  
+  history.forEach((item, index) => {
+    aggregatedContext += `
+    --- PAPER ${index + 1} ---
+    ID: ${item.id}
+    Title: ${item.title}
+    Analysis Content:
+    ${item.analysis.markdown}
+    
+    User Discussion History for this paper:
+    ${item.chatMessages.map(m => `${m.role}: ${m.content}`).join('\n')}
+    -------------------------
+    `;
+  });
+
+  const prompt = `
+    Role: Chief Research Scientist and Technology Strategist.
+    
+    Task: Based on the provided "Research History" containing analyses and discussions of multiple papers, generate a high-level **Trend & Evolution Report**.
+    
+    Input Data:
+    ${aggregatedContext}
+
+    Instructions:
+    1. **Chronological Ordering**: Do NOT follow the order of the input. Instead, identify the *publication year* or era of each paper from its content and sort your analysis chronologically (from past to present).
+    2. **Field Evolution**: Describe how the field has evolved over time based strictly on these papers. How have the problem definitions shifted?
+    3. **Architecture & Technical Flows**: Map the technical trajectory. (e.g., "Shift from CNNs to ViTs", or "Evolution of RAG techniques").
+    4. **Current & Future Directions**: 
+       - What is the current "State of the Art" or trend based on the latest papers in this set?
+       - Propose 3 concrete "Research Ideas" or "Gap Areas" that the user could explore next.
+    5. **Recommended Reading (Verification Required)**:
+       - **CRITICAL**: Use your Search Tool to find 3-5 *actual* and *recent* papers (published in the last 12 months) that align with the "Current Trends" you identified. 
+       - **VERIFY**: Before listing a paper, use search to confirm it exists and is relevant. Do not hallucinate titles.
+       - Format them as a list with Markdown links: "- **Title** (Year) - [Link Title](URL)"
+    
+    Output Format (Markdown):
+    
+    # 📈 领域演进与趋势深度分析报告
+
+    ## 1. ⏳ 演进时间轴 (Chronological Evolution)
+    (Provide a timeline view of the papers analyzed, highlighting key milestones)
+
+    ## 2. 🧬 架构与方法论变迁 (Technical Evolution)
+    (Deep dive into how the algorithms or theoretical frameworks have changed)
+
+    ## 3. 🔥 最新潮流与热点 (Current Trends)
+    (Synthesize the cutting-edge focus found in the most recent papers)
+
+    ## 4. 🚀 未来方向与Idea建议 (Future Directions)
+    (Propose specific, novel research directions based on the gaps identified)
+
+    ## 5. 📚 推荐阅读 (Verified Recent Papers)
+    (List of verifiable, recent papers found via search, with links)
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview', 
+      contents: prompt,
+      config: {
+        temperature: 0.4,
+        tools: [{ googleSearch: {} }], // Enable search for finding real papers
+      }
+    });
+
+    return response.text || "Failed to generate trend report.";
+
+  } catch (error) {
+    console.error("Trend Analysis Error:", error);
     throw error;
   }
 };

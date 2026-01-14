@@ -23,6 +23,14 @@ export interface ChatMessage {
   timestamp: number;
 }
 
+export interface HistoryItem {
+  id: string;
+  title: string;
+  timestamp: number;
+  analysis: AnalysisResult;
+  chatMessages: ChatMessage[];
+}
+
 export enum LoadingState {
   IDLE = 'IDLE',
   SEARCHING = 'SEARCHING',
