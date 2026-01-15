@@ -48,7 +48,7 @@
 
 1.  **Clone the repository**
     ```bash
-    git clone https://github.com/yourusername/paperinsight-ai.git
+    git clone https://github.com/yq-wang-r/PaperInsight-AI.git
     cd paperinsight-ai
     ```
 
