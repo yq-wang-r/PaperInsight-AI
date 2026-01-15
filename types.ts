@@ -1,3 +1,4 @@
+
 export interface GroundingChunk {
   web?: {
     uri: string;
@@ -23,22 +24,6 @@ export interface ChatMessage {
   timestamp: number;
 }
 
-export interface HistoryItem {
-  id: string;
-  title: string;
-  timestamp: number;
-  analysis: AnalysisResult;
-  chatMessages: ChatMessage[];
-}
-
-export enum LoadingState {
-  IDLE = 'IDLE',
-  SEARCHING = 'SEARCHING',
-  ANALYZING = 'ANALYZING',
-  COMPLETED = 'COMPLETED',
-  ERROR = 'ERROR',
-}
-
 export interface TimelinessReport {
   isOutdated: boolean;
   status: string; // e.g., "Legacy", "Current", "Obsolete"
@@ -51,8 +36,44 @@ export interface TimelinessReport {
   }>;
 }
 
+export interface VenueReport {
+  name: string;
+  type: 'Conference' | 'Journal' | 'Unknown';
+  quality: string; // e.g. "CCF A", "Q1", "Top Tier"
+  summary: string;
+}
+
 export interface IntegrityReport {
   hasIssues: boolean; // True if red flags found
   summary: string;
   sources?: string[];
+}
+
+export interface HistoryItem {
+  id: string;
+  title: string;
+  timestamp: number;
+  analysis: AnalysisResult;
+  chatMessages: ChatMessage[];
+  timelinessReport?: TimelinessReport;
+  venueReport?: VenueReport;
+  integrityReport?: IntegrityReport;
+}
+
+export enum LoadingState {
+  IDLE = 'IDLE',
+  SEARCHING = 'SEARCHING',
+  ANALYZING = 'ANALYZING',
+  COMPLETED = 'COMPLETED',
+  ERROR = 'ERROR',
+}
+
+export type ApiProvider = 'gemini' | 'zhipu' | 'openai' | 'siliconflow';
+
+export interface UserSettings {
+  provider: ApiProvider;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  enableSearch: boolean;
 }

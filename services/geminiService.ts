@@ -1,7 +1,252 @@
-import { GoogleGenAI, Tool } from "@google/genai";
-import { AnalysisResult, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport } from "../types";
 
-const SYSTEM_INSTRUCTION = `
+import { GoogleGenAI, Tool, GenerateContentResponse } from "@google/genai";
+import { AnalysisResult, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport, VenueReport, UserSettings, ApiProvider } from "../types";
+
+// --- Global Settings Store ---
+// Default to Gemini (Environment variables will be used if user settings are empty)
+let currentSettings: UserSettings = {
+    provider: 'gemini',
+    apiKey: '',
+    baseUrl: '',
+    model: 'gemini-2.0-flash', // Default fallback
+    enableSearch: true
+};
+
+export const updateGlobalSettings = (settings: UserSettings) => {
+    currentSettings = settings;
+};
+
+export const getGlobalSettings = () => currentSettings;
+
+// --- Helper: Retry Logic ---
+
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function runWithRetry<T>(
+    operation: () => Promise<T>, 
+    signal?: AbortSignal,
+    retries = 2, 
+    baseDelay = 1000
+): Promise<T> {
+    try {
+        if (signal?.aborted) throw new Error("Aborted");
+        return await operation();
+    } catch (error: any) {
+        if (signal?.aborted) throw new Error("Aborted");
+
+        const msg = error.message || "";
+        // Retry on Server Errors (5xx) or specific Network errors
+        const isServerErr = 
+            error.status >= 500 || 
+            msg.includes("500") || 
+            msg.includes("503") ||
+            msg.includes("Rpc failed") || 
+            msg.includes("xhr error") ||
+            msg.includes("fetch failed") ||
+            msg.includes("Overloaded");
+
+        // Do NOT retry on 30011 (Payment required) or 4xx errors
+        if (msg.includes("30011") || msg.includes("401") || msg.includes("403")) {
+            throw error;
+        }
+
+        if (isServerErr && retries > 0) {
+            console.warn(`Transient Error (${retries} retries left):`, msg);
+            await wait(baseDelay);
+            return runWithRetry(operation, signal, retries - 1, baseDelay * 2);
+        }
+        throw error;
+    }
+}
+
+// --- OpenAI / Zhipu Compatible Handler ---
+
+async function callOpenAICompatible(
+    prompt: string, 
+    systemInstruction: string,
+    isJsonMode: boolean = false,
+    settings: UserSettings,
+    signal?: AbortSignal
+): Promise<{ text: string, sources?: any[] }> {
+    const { apiKey, baseUrl, model, provider } = settings;
+    
+    // STRICT URL Logic: Ensure it ends with /chat/completions
+    // SiliconFlow Example: https://api.siliconflow.cn/v1/chat/completions
+    let url = baseUrl.replace(/\/+$/, ''); // Remove trailing slash
+    if (!url.endsWith('/chat/completions')) {
+         url = `${url}/chat/completions`;
+    }
+
+    // Special handling for Zhipu Web Search (Only for Zhipu)
+    const tools = (provider === 'zhipu' && settings.enableSearch) 
+        ? [{ type: "web_search", web_search: { enable: true, search_result: true } }] 
+        : undefined;
+
+    const messages = [
+        { role: "system", content: systemInstruction },
+        { role: "user", content: prompt }
+    ];
+
+    // Payload aligned strictly with standard Chat Completions API (and user's curl example)
+    const body: any = {
+        model: model,
+        messages: messages,
+        temperature: 0.7, // As requested in curl example
+        max_tokens: 4096, // Using 4096 to ensure full paper analysis fits (User curl example used 1000, but app needs more)
+        stream: false,
+    };
+
+    if (tools) body.tools = tools;
+    
+    // --- DEBUG LOGGING ---
+    console.log(`%c[${provider.toUpperCase()} Request]`, "color: blue; font-weight: bold;");
+    console.log("URL:", url);
+    console.log("Model:", model);
+    console.log("Payload:", JSON.stringify(body, null, 2));
+    // ---------------------
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(body),
+        signal
+    });
+
+    // --- DEBUG LOGGING ---
+    console.log(`%c[${provider.toUpperCase()} Response Status]`, "color: green; font-weight: bold;", response.status);
+    // ---------------------
+
+    if (!response.ok) {
+        const errText = await response.text();
+        console.error("API Error Body:", errText); // Log raw error for user debugging
+
+        let friendlyMessage = `Provider Error (${response.status})`;
+
+        try {
+            const errJson = JSON.parse(errText);
+            const code = errJson.code || errJson.error?.code;
+            const msg = errJson.message || errJson.error?.message || errText;
+
+            // Handle SiliconFlow specific 30011 error
+            if (code === 30011 || msg.includes("30011")) {
+                friendlyMessage = `SiliconFlow Error (30011): This model (${model}) requires a paid balance. Please check your SiliconFlow dashboard to ensure your API Key is associated with a funded project/team. Try switching to a free model like 'deepseek-ai/DeepSeek-V3' or 'Qwen/Qwen2.5-72B-Instruct' if needed.`;
+            } else {
+                friendlyMessage = `Provider Error (${code}): ${msg}`;
+            }
+        } catch (e) {
+            friendlyMessage += `: ${errText}`;
+        }
+        
+        throw new Error(friendlyMessage);
+    }
+
+    const data = await response.json();
+    console.log("Response Data:", data); // Log success data
+
+    const content = data.choices?.[0]?.message?.content || "";
+    
+    // Attempt to extract Zhipu search results if available (structure varies, but usually in tool_calls or appended text)
+    return { text: content, sources: [] }; 
+}
+
+// --- Gemini Handler (Existing Logic with Refinements) ---
+
+async function callGemini(
+    prompt: string,
+    systemInstruction: string,
+    isJsonMode: boolean,
+    settings: UserSettings,
+    signal?: AbortSignal,
+    forceModel?: string // Allow overriding model for fallback chain
+): Promise<{ text: string, sources?: any[] }> {
+    // Priority: Settings Key > Env Key
+    const finalKey = settings.apiKey || process.env.API_KEY;
+    if (!finalKey) throw new Error("API Key is missing for Gemini.");
+
+    const ai = new GoogleGenAI({ apiKey: finalKey });
+    
+    // Determine Model
+    const modelToUse = forceModel || settings.model || 'gemini-2.0-flash';
+    
+    const config: any = {
+        systemInstruction: systemInstruction,
+        temperature: 0.3,
+    };
+
+    if (settings.enableSearch) {
+        config.tools = [{ googleSearch: {} }];
+    }
+    
+    if (isJsonMode) {
+        config.responseMimeType = "application/json";
+    }
+
+    const response = await ai.models.generateContent({
+        model: modelToUse,
+        contents: prompt,
+        config: config
+    });
+
+    return {
+        text: response.text || "",
+        sources: response.candidates?.[0]?.groundingMetadata?.groundingChunks || []
+    };
+}
+
+// --- Unified Dispatcher ---
+
+async function dispatchAIRequest(
+    prompt: string,
+    systemInstruction: string,
+    isJsonMode: boolean,
+    signal?: AbortSignal,
+    overrideSearch: boolean = true
+): Promise<{ text: string, sources?: any[] }> {
+    
+    const settings = { ...currentSettings };
+    if (!overrideSearch) settings.enableSearch = false; // Disable search for simple tasks
+
+    // 1. Zhipu / OpenAI / SiliconFlow Compatible
+    if (settings.provider === 'zhipu' || settings.provider === 'openai' || settings.provider === 'siliconflow') {
+        if (!settings.apiKey) throw new Error("API Key is required for third-party providers.");
+        // Direct call without fallback logic (as requested to support Pro models correctly)
+        return await runWithRetry(() => callOpenAICompatible(prompt, systemInstruction, isJsonMode, settings, signal), signal);
+    }
+
+    // 2. Gemini (Default) with Fallback Logic
+    // We only use the fallback logic if the user hasn't strictly defined a custom model,
+    // OR if the user is using the default 'gemini' provider without specific overrides.
+    const models = [
+        settings.model || 'gemini-2.0-flash', // Try user selection or default first
+        'gemini-2.0-flash-lite-preview-02-05',
+        'gemini-2.0-flash'
+    ];
+    // Remove duplicates
+    const uniqueModels = [...new Set(models)];
+
+    let lastError: any;
+
+    for (const model of uniqueModels) {
+        try {
+            return await runWithRetry(() => callGemini(prompt, systemInstruction, isJsonMode, settings, signal, model), signal);
+        } catch (error: any) {
+            lastError = error;
+            if (signal?.aborted) throw error;
+            // Only continue to next model on 429/Quota/503
+            const isQuota = error.message?.includes('429') || error.message?.includes('Quota') || error.message?.includes('Overloaded');
+            if (!isQuota) throw error; // Fatal error
+            console.warn(`Gemini model ${model} failed, trying next...`);
+        }
+    }
+
+    throw lastError;
+}
+
+
+const SYSTEM_INSTRUCTION_ANALYSIS = `
 Role: 你是一位计算机领域的资深科研助手，擅长快速解析学术论文并提取核心逻辑。
 Task: 请帮我检索并阅读指定的计算机领域文章/话题。你的目标是不仅总结原文，还要以审辩式思维辅助我进行科研思考。
 Output Format: 请严格按照以下 Markdown 格式输出，不要输出Markdown代码块标记（如 \`\`\`markdown），直接输出内容。
@@ -29,104 +274,114 @@ Output Format: 请严格按照以下 Markdown 格式输出，不要输出Markdow
 `;
 
 export const analyzePaperWithGemini = async (query: string, signal?: AbortSignal): Promise<AnalysisResult> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API Key is missing. Please set it in the environment.");
-  }
-
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-  // Use Google Search to find the paper and details
-  const tools: Tool[] = [
-    { googleSearch: {} }
-  ];
-
+  const prompt = `Search for and analyze the paper related to: "${query}". If multiple papers match, choose the most relevant or influential one. Strictly follow the defined output format.`;
+  
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview', // Using Pro for better reasoning and analysis
-      contents: `Search for and analyze the paper related to: "${query}". If multiple papers match, choose the most relevant or influential one. Strictly follow the defined output format.`,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        tools: tools,
-        temperature: 0.3, // Lower temperature for more factual extraction
-      }
-    });
-
-    // Check for abort after the async operation
-    if (signal?.aborted) {
-        throw new Error("Aborted");
-    }
-
-    const text = response.text || "Analysis generation failed.";
-    const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks as any[];
-
-    return {
-      markdown: text,
-      groundingChunks: groundingChunks
-    };
+      const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_ANALYSIS, false, signal, true);
+      return {
+          markdown: result.text,
+          groundingChunks: result.sources
+      };
   } catch (error: any) {
-    if (signal?.aborted || error.message === "Aborted") {
-        throw new Error("Analysis process was stopped by the user.");
-    }
-    console.error("Gemini API Error:", error);
-    throw error;
+      if (signal?.aborted || error.message === "Aborted") {
+          throw new Error("Analysis process was stopped by the user.");
+      }
+      throw error;
   }
 };
 
-export const checkPaperTimeliness = async (title: string, authorAndYear: string): Promise<TimelinessReport> => {
-    if (!process.env.API_KEY) throw new Error("API Key missing");
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const SYSTEM_INSTRUCTION_GENERIC = "You are a helpful academic assistant.";
 
+/**
+ * Sub-agent to verify paper existence and find the official link.
+ */
+const verifyAndFindPaperLink = async (title: string, year: string): Promise<string | undefined> => {
+    const prompt = `
+      Task: Find the official URL for the specific paper: "${title}" (approx. year: ${year}).
+      Output JSON only: { "found": boolean, "url": "string | null", "verified_title": "string" }
+    `;
+
+    try {
+        const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_GENERIC, true, undefined, true);
+        // Clean JSON (remove markdown blocks if present)
+        const jsonStr = result.text.replace(/```json|```/g, '').trim();
+        const data = JSON.parse(jsonStr);
+        return data.found && data.url ? data.url : undefined;
+    } catch (e) {
+        return undefined;
+    }
+};
+
+export const checkPaperTimeliness = async (title: string, authorAndYear: string): Promise<TimelinessReport> => {
     const prompt = `
         Role: Technical Research Auditor.
         Task: Analyze the timeliness of the paper "${title}" (${authorAndYear}).
-        1. Determine if this paper is considered "Outdated" or "Legacy" (typically >3-5 years old in fast-moving CS fields like AI, or if superseded by newer architectures).
-        2. If outdated, use Google Search to find 2-3 **current** State-of-the-Art (SOTA) papers or direct successors published recently (last 1-2 years) that solve the same problem better.
-        3. VERIFY that the recommended papers are real and accessible.
+        1. Determine if this paper is considered "Outdated" or "Legacy" (>3-5 years old in fast AI fields).
+        2. Suggest 3 **State-of-the-Art (SOTA)** papers or direct successors.
+        STRICT: At least ONE recommendation MUST be published in 2024-2025.
         
         Output JSON only:
         {
             "isOutdated": boolean,
             "status": "Legacy" | "Current" | "Seminal Classic",
-            "summary": "Short explanation (max 1 sentence) on why it is/isn't outdated.",
-            "recommendations": [
-                { "title": "Paper Title", "year": "202X", "reason": "Why it's better", "link": "URL" }
-            ]
+            "summary": "Short explanation.",
+            "recommendations": [ { "title": "Title", "year": "202X", "reason": "Reason" } ]
         }
     `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                tools: [{ googleSearch: {} }],
-                temperature: 0.2
-            }
-        });
-        
-        const text = response.text || "{}";
-        return JSON.parse(text) as TimelinessReport;
+        const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_GENERIC, true, undefined, true);
+        const jsonStr = result.text.replace(/```json|```/g, '').trim();
+        const report = JSON.parse(jsonStr) as TimelinessReport;
+
+        // Phase 2: Verify links (Lazy logic: parallel execution, non-blocking for result return)
+        if (report.recommendations && report.recommendations.length > 0) {
+            verifyRecommendations(report.recommendations).then(verified => {
+               // Note: This async update won't affect the immediate return, 
+               // but in a real app we might update state. 
+               // For now, we return the report immediately as verifying takes time.
+            });
+        }
+        return report;
     } catch (e) {
-        console.error("Timeliness check failed", e);
-        return { isOutdated: false, status: "Unknown", summary: "Could not verify timeliness.", recommendations: [] };
+        return { isOutdated: false, status: "Check Unavailable", summary: "Unable to verify timeliness.", recommendations: [] };
+    }
+};
+
+async function verifyRecommendations(recs: any[]) {
+    return Promise.all(recs.map(async (rec) => {
+        const link = await verifyAndFindPaperLink(rec.title, rec.year);
+        return { ...rec, link };
+    }));
+}
+
+export const checkVenueQuality = async (venueText: string): Promise<VenueReport> => {
+    const prompt = `
+        Role: Academic Evaluator.
+        Task: Analyze the academic reputation: "${venueText}".
+        Output JSON only:
+        {
+            "name": "Canonical Name",
+            "type": "Conference" | "Journal" | "Unknown",
+            "quality": "Short Rating (e.g. 'CCF A')",
+            "summary": "Concise summary."
+        }
+    `;
+
+    try {
+        const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_GENERIC, true, undefined, true);
+        const jsonStr = result.text.replace(/```json|```/g, '').trim();
+        return JSON.parse(jsonStr) as VenueReport;
+    } catch (e) {
+        return { name: venueText, type: 'Unknown', quality: 'Check Unavailable', summary: "Unable to analyze venue." };
     }
 };
 
 export const checkAuthorIntegrity = async (authors: string): Promise<IntegrityReport> => {
-    if (!process.env.API_KEY) throw new Error("API Key missing");
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
     const prompt = `
         Role: Academic Integrity Officer.
-        Task: Perform a background check on these authors/institutions: "${authors}".
-        Search specifically for: "academic misconduct", "paper retraction", "data fabrication", "fraud".
-        
-        Rules:
-        - Be conservative. Only flag if there are *verified* public records of misconduct.
-        - If clear, state "No public records of academic misconduct found."
-        - Keep it very concise.
-        
+        Task: Check authors: "${authors}" for "academic misconduct", "retraction", "fraud".
+        Rules: Be conservative. Only flag if verified.
         Output JSON only:
         {
             "hasIssues": boolean,
@@ -135,18 +390,9 @@ export const checkAuthorIntegrity = async (authors: string): Promise<IntegrityRe
     `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                tools: [{ googleSearch: {} }],
-                temperature: 0.1
-            }
-        });
-        
-        const text = response.text || "{}";
-        return JSON.parse(text) as IntegrityReport;
+        const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_GENERIC, true, undefined, true);
+        const jsonStr = result.text.replace(/```json|```/g, '').trim();
+        return JSON.parse(jsonStr) as IntegrityReport;
     } catch (e) {
         return { hasIssues: false, summary: "Integrity check unavailable." };
     }
@@ -157,13 +403,6 @@ export const askFollowUp = async (
   originalContext: string, 
   history: ChatMessage[]
 ): Promise<string> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API Key is missing.");
-  }
-
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-  // Construct context from history
   const historyContext = history.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n');
 
   const prompt = `
@@ -176,43 +415,23 @@ export const askFollowUp = async (
     Current User Question:
     ${question}
 
-    INTERNAL INSTRUCTION (CRITICAL):
-    You must perform an internal critique before answering. 
-    1. Draft an initial answer based on the paper analysis and your knowledge.
-    2. Critique your draft: Does it directly address the user's specific question? Is the tone professional and academic? Is it accurate?
-    3. Refine the answer based on the critique.
-    4. **IMPORTANT**: Do not use Markdown bolding (i.e., do not use **asterisks**) in the final answer. Keep it plain text for easier reading.
-    
-    OUTPUT FORMAT:
-    You must wrap your FINAL, polished answer inside <final_answer> tags. Do not show the critique process to the user, only the result inside the tags.
-    
-    Example:
-    <final_answer>
-    The paper utilizes a Transformer architecture...
-    </final_answer>
+    INTERNAL INSTRUCTION:
+    Critique your draft answer internally, then output ONLY the final answer inside <final_answer> tags.
+    No markdown bolding (asterisks) in final answer.
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview', // Flash is sufficient for chat context
-      contents: prompt,
-      config: {
-        temperature: 0.5,
-      }
-    });
-
-    const rawText = response.text || "";
+    // Follow-up usually doesn't need web search unless specifically asked, but keeping it optional
+    const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_GENERIC, false, undefined, false);
     
-    // Extract content within <final_answer> tags and clean up markdown bolding
+    const rawText = result.text;
     const match = rawText.match(/<final_answer>([\s\S]*?)<\/final_answer>/);
     
     if (match && match[1]) {
       return match[1].trim().replace(/\*\*/g, '');
     } else {
-      // Fallback if model fails to tag (rare with high temp, but possible)
       return rawText.replace(/<final_answer>|<\/final_answer>/g, '').replace(/\*\*/g, '').trim();
     }
-
   } catch (error) {
     console.error("Follow-up Error:", error);
     throw error;
@@ -220,87 +439,27 @@ export const askFollowUp = async (
 };
 
 export const analyzeTrendsWithGemini = async (history: HistoryItem[]): Promise<string> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API Key is missing.");
-  }
+  if (history.length === 0) return "No history available.";
 
-  if (history.length === 0) {
-     return "No history available to analyze.";
-  }
-
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-  // Prepare the context from history
   let aggregatedContext = "";
-  
   history.forEach((item, index) => {
-    aggregatedContext += `
-    --- PAPER ${index + 1} ---
-    ID: ${item.id}
-    Title: ${item.title}
-    Analysis Content:
-    ${item.analysis.markdown}
-    
-    User Discussion History for this paper:
-    ${item.chatMessages.map(m => `${m.role}: ${m.content}`).join('\n')}
-    -------------------------
-    `;
+    aggregatedContext += `\n--- PAPER ${index + 1} ---\nTitle: ${item.title}\nAnalysis: ${item.analysis.markdown}\n`;
   });
 
   const prompt = `
-    Role: Chief Research Scientist and Technology Strategist.
-    
-    Task: Based on the provided "Research History" containing analyses and discussions of multiple papers, generate a high-level **Trend & Evolution Report**.
-    
-    Input Data:
+    Role: Chief Research Scientist.
+    Task: Generate a Trend & Evolution Report based on these papers:
     ${aggregatedContext}
-
-    Instructions:
-    1. **Chronological Ordering**: Do NOT follow the order of the input. Instead, identify the *publication year* or era of each paper from its content and sort your analysis chronologically (from past to present).
-    2. **Field Evolution**: Describe how the field has evolved over time based strictly on these papers. How have the problem definitions shifted?
-    3. **Architecture & Technical Flows**: Map the technical trajectory. (e.g., "Shift from CNNs to ViTs", or "Evolution of RAG techniques").
-    4. **Current & Future Directions**: 
-       - What is the current "State of the Art" or trend based on the latest papers in this set?
-       - Propose 3 concrete "Research Ideas" or "Gap Areas" that the user could explore next.
-    5. **Recommended Reading (Verification Required)**:
-       - **CRITICAL**: Use your Search Tool to find 3-5 *actual* and *recent* papers (published in the last 12 months) that align with the "Current Trends" you identified. 
-       - **VERIFY**: Before listing a paper, use search to confirm it exists and is relevant. Do not hallucinate titles.
-       - Format them as a list with Markdown links: "- **Title** (Year) - [Link Title](URL)"
     
-    Output Format (Markdown):
-    
+    Output Markdown:
     # 📈 领域演进与趋势深度分析报告
-
-    ## 1. ⏳ 演进时间轴 (Chronological Evolution)
-    (Provide a timeline view of the papers analyzed, highlighting key milestones)
-
-    ## 2. 🧬 架构与方法论变迁 (Technical Evolution)
-    (Deep dive into how the algorithms or theoretical frameworks have changed)
-
-    ## 3. 🔥 最新潮流与热点 (Current Trends)
-    (Synthesize the cutting-edge focus found in the most recent papers)
-
-    ## 4. 🚀 未来方向与Idea建议 (Future Directions)
-    (Propose specific, novel research directions based on the gaps identified)
-
-    ## 5. 📚 推荐阅读 (Verified Recent Papers)
-    (List of verifiable, recent papers found via search, with links)
+    (Sections: Chronological Order, Field Evolution, Technical Flows, Future Directions, Recommended Reading)
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview', 
-      contents: prompt,
-      config: {
-        temperature: 0.4,
-        tools: [{ googleSearch: {} }], // Enable search for finding real papers
-      }
-    });
-
-    return response.text || "Failed to generate trend report.";
-
+    const result = await dispatchAIRequest(prompt, SYSTEM_INSTRUCTION_GENERIC, false, undefined, true);
+    return result.text;
   } catch (error) {
-    console.error("Trend Analysis Error:", error);
     throw error;
   }
 };

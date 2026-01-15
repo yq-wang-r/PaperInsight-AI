@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ChatMessage } from '../types';
 import { askFollowUp } from '../services/geminiService';
+import MarkdownRenderer from './MarkdownRenderer';
 
 interface ChatInterfaceProps {
   originalAnalysis: string;
@@ -132,7 +133,9 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ originalAnalysis, message
                   : 'bg-white border border-slate-200 text-slate-700 rounded-bl-none'
               }`}
             >
-              <div className="whitespace-pre-wrap">{msg.content.replace(/\*\*/g, '')}</div>
+              <div className="whitespace-pre-wrap">
+                 <MarkdownRenderer content={msg.content} className={msg.role === 'user' ? 'text-white' : 'text-slate-700'} />
+              </div>
             </div>
           </div>
         ))}

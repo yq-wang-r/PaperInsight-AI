@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { PaperSection } from '../types';
+import MarkdownRenderer from './MarkdownRenderer';
 
 interface AnalysisDisplayProps {
   content: string;
@@ -37,30 +38,30 @@ const SectionCard: React.FC<{ section: PaperSection }> = ({ section }) => {
       </div>
       <div className="p-6 text-slate-700 leading-7">
         {section.content.split('\n').map((line, i) => {
-          // Clean text: remove markdown bold syntax (**)
-          const cleanLine = line.replace(/\*\*/g, '');
-
-          // Simple formatting for keys like "Title:", "Highlight:"
-          const isKeyLine = cleanLine.match(/^.*?:/);
-          if (isKeyLine) {
-             const parts = cleanLine.split(':');
-             const key = parts[0];
-             const value = parts.slice(1).join(':');
+          // Detect key-value pair pattern: "Key: Value" or "**Key**: Value"
+          // We assume keys are short (< 50 chars) to avoid false positives on long sentences with colons.
+          const firstColonIndex = line.indexOf(':');
+          
+          if (firstColonIndex > -1 && firstColonIndex < 50) {
+             const key = line.slice(0, firstColonIndex).replace(/\*\*/g, ''); // Clean key (remove bold markers if any)
+             const value = line.slice(firstColonIndex + 1);
              return (
                <div key={i} className="mb-2">
                  <span className="font-semibold text-slate-900">{key}:</span>
-                 <span className="text-slate-600">{value}</span>
+                 <span className="text-slate-600 ml-2"><MarkdownRenderer content={value} /></span>
                </div>
              )
           }
+
           // Bullet points
-          if (cleanLine.trim().startsWith('- ') || cleanLine.trim().match(/^\d+\./)) {
-              return <div key={i} className="ml-4 mb-1 text-slate-700">{cleanLine}</div>;
+          if (line.trim().startsWith('- ') || line.trim().match(/^\d+\./)) {
+              return <div key={i} className="ml-4 mb-1 text-slate-700"><MarkdownRenderer content={line} /></div>;
           }
           // Empty lines
-          if (!cleanLine.trim()) return <div key={i} className="h-2"></div>;
+          if (!line.trim()) return <div key={i} className="h-2"></div>;
           
-          return <p key={i} className="mb-2">{cleanLine}</p>;
+          // Regular paragraphs
+          return <div key={i} className="mb-2"><MarkdownRenderer content={line} /></div>;
         })}
       </div>
     </div>
@@ -98,16 +99,15 @@ const AnalysisDisplay: React.FC<AnalysisDisplayProps> = ({ content }) => {
 
   // Fallback if parsing fails (e.g. model didn't follow strict format)
   if (parsedSections.length === 0) {
-    const cleanContent = content.replace(/\*\*/g, '');
     return (
       <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200 whitespace-pre-wrap leading-relaxed text-slate-700 relative group">
         <button 
-             onClick={() => navigator.clipboard.writeText(cleanContent)}
+             onClick={() => navigator.clipboard.writeText(content)}
              className="absolute top-4 right-4 p-2 rounded-lg bg-slate-100 text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-colors opacity-0 group-hover:opacity-100"
         >
             <i className="fas fa-copy"></i>
         </button>
-        {cleanContent}
+        <MarkdownRenderer content={content} />
       </div>
     );
   }
