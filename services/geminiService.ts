@@ -1,5 +1,5 @@
 import { GoogleGenAI, Tool } from "@google/genai";
-import { AnalysisResult, ChatMessage, HistoryItem } from "../types";
+import { AnalysisResult, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport } from "../types";
 
 const SYSTEM_INSTRUCTION = `
 Role: 你是一位计算机领域的资深科研助手，擅长快速解析学术论文并提取核心逻辑。
@@ -28,7 +28,7 @@ Output Format: 请严格按照以下 Markdown 格式输出，不要输出Markdow
 备注: [结合当前计算机领域的技术趋势（如大模型、边缘计算等）给出深度的专业评价。]
 `;
 
-export const analyzePaperWithGemini = async (query: string): Promise<AnalysisResult> => {
+export const analyzePaperWithGemini = async (query: string, signal?: AbortSignal): Promise<AnalysisResult> => {
   if (!process.env.API_KEY) {
     throw new Error("API Key is missing. Please set it in the environment.");
   }
@@ -51,6 +51,11 @@ export const analyzePaperWithGemini = async (query: string): Promise<AnalysisRes
       }
     });
 
+    // Check for abort after the async operation
+    if (signal?.aborted) {
+        throw new Error("Aborted");
+    }
+
     const text = response.text || "Analysis generation failed.";
     const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks as any[];
 
@@ -58,10 +63,93 @@ export const analyzePaperWithGemini = async (query: string): Promise<AnalysisRes
       markdown: text,
       groundingChunks: groundingChunks
     };
-  } catch (error) {
+  } catch (error: any) {
+    if (signal?.aborted || error.message === "Aborted") {
+        throw new Error("Analysis process was stopped by the user.");
+    }
     console.error("Gemini API Error:", error);
     throw error;
   }
+};
+
+export const checkPaperTimeliness = async (title: string, authorAndYear: string): Promise<TimelinessReport> => {
+    if (!process.env.API_KEY) throw new Error("API Key missing");
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const prompt = `
+        Role: Technical Research Auditor.
+        Task: Analyze the timeliness of the paper "${title}" (${authorAndYear}).
+        1. Determine if this paper is considered "Outdated" or "Legacy" (typically >3-5 years old in fast-moving CS fields like AI, or if superseded by newer architectures).
+        2. If outdated, use Google Search to find 2-3 **current** State-of-the-Art (SOTA) papers or direct successors published recently (last 1-2 years) that solve the same problem better.
+        3. VERIFY that the recommended papers are real and accessible.
+        
+        Output JSON only:
+        {
+            "isOutdated": boolean,
+            "status": "Legacy" | "Current" | "Seminal Classic",
+            "summary": "Short explanation (max 1 sentence) on why it is/isn't outdated.",
+            "recommendations": [
+                { "title": "Paper Title", "year": "202X", "reason": "Why it's better", "link": "URL" }
+            ]
+        }
+    `;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                tools: [{ googleSearch: {} }],
+                temperature: 0.2
+            }
+        });
+        
+        const text = response.text || "{}";
+        return JSON.parse(text) as TimelinessReport;
+    } catch (e) {
+        console.error("Timeliness check failed", e);
+        return { isOutdated: false, status: "Unknown", summary: "Could not verify timeliness.", recommendations: [] };
+    }
+};
+
+export const checkAuthorIntegrity = async (authors: string): Promise<IntegrityReport> => {
+    if (!process.env.API_KEY) throw new Error("API Key missing");
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const prompt = `
+        Role: Academic Integrity Officer.
+        Task: Perform a background check on these authors/institutions: "${authors}".
+        Search specifically for: "academic misconduct", "paper retraction", "data fabrication", "fraud".
+        
+        Rules:
+        - Be conservative. Only flag if there are *verified* public records of misconduct.
+        - If clear, state "No public records of academic misconduct found."
+        - Keep it very concise.
+        
+        Output JSON only:
+        {
+            "hasIssues": boolean,
+            "summary": "Concise findings."
+        }
+    `;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                tools: [{ googleSearch: {} }],
+                temperature: 0.1
+            }
+        });
+        
+        const text = response.text || "{}";
+        return JSON.parse(text) as IntegrityReport;
+    } catch (e) {
+        return { hasIssues: false, summary: "Integrity check unavailable." };
+    }
 };
 
 export const askFollowUp = async (

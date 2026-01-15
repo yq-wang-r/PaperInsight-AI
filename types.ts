@@ -38,3 +38,21 @@ export enum LoadingState {
   COMPLETED = 'COMPLETED',
   ERROR = 'ERROR',
 }
+
+export interface TimelinessReport {
+  isOutdated: boolean;
+  status: string; // e.g., "Legacy", "Current", "Obsolete"
+  summary: string;
+  recommendations?: Array<{
+    title: string;
+    year: string;
+    reason: string;
+    link?: string;
+  }>;
+}
+
+export interface IntegrityReport {
+  hasIssues: boolean; // True if red flags found
+  summary: string;
+  sources?: string[];
+}

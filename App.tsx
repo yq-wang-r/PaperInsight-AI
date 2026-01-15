@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from 'react';
-import { analyzePaperWithGemini, analyzeTrendsWithGemini } from './services/geminiService';
-import { AnalysisResult, LoadingState, ChatMessage, HistoryItem } from './types';
+import React, { useState, useEffect, useRef } from 'react';
+import { analyzePaperWithGemini, analyzeTrendsWithGemini, checkPaperTimeliness, checkAuthorIntegrity } from './services/geminiService';
+import { AnalysisResult, LoadingState, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport } from './types';
 import AnalysisDisplay from './components/AnalysisDisplay';
 import LoadingView from './components/LoadingView';
 import ChatInterface from './components/ChatInterface';
 
 const HISTORY_KEY = 'paper_insight_history_v1';
+const DELETED_HISTORY_KEY = 'paper_insight_deleted_history_v1';
 
 // Robust Markdown Renderer for Trend Report
 const TrendReportDisplay: React.FC<{ content: string }> = ({ content }) => {
@@ -81,6 +82,92 @@ const TrendReportDisplay: React.FC<{ content: string }> = ({ content }) => {
   return <div className="p-2 animate-fade-in">{nodes}</div>;
 };
 
+// --- New Widgets ---
+
+const TimelinessWidget: React.FC<{ report: TimelinessReport }> = ({ report }) => {
+    const [isOpen, setIsOpen] = useState(false);
+
+    return (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden mt-8">
+            <button 
+                onClick={() => setIsOpen(!isOpen)}
+                className="w-full flex items-center justify-between p-4 bg-slate-50 hover:bg-slate-100 transition-colors"
+            >
+                <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center ${report.isOutdated ? 'bg-orange-100 text-orange-600' : 'bg-green-100 text-green-600'}`}>
+                        <i className={`fas ${report.isOutdated ? 'fa-clock-rotate-left' : 'fa-check-circle'}`}></i>
+                    </div>
+                    <div className="text-left">
+                        <h3 className="font-bold text-slate-800 text-sm">Timeliness Check</h3>
+                        <p className="text-xs text-slate-500">Status: {report.status}</p>
+                    </div>
+                </div>
+                <i className={`fas fa-chevron-down text-slate-400 transition-transform ${isOpen ? 'rotate-180' : ''}`}></i>
+            </button>
+            
+            {isOpen && (
+                <div className="p-5 border-t border-slate-100 bg-white animate-fade-in">
+                    <p className="text-slate-700 text-sm mb-4 leading-relaxed">{report.summary}</p>
+                    
+                    {report.recommendations && report.recommendations.length > 0 && (
+                        <div className="space-y-3">
+                            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">Recommended Updates</h4>
+                            {report.recommendations.map((rec, i) => (
+                                <div key={i} className="p-3 bg-blue-50/50 rounded-lg border border-blue-100">
+                                    <div className="flex justify-between items-start mb-1">
+                                        <a href={rec.link} target="_blank" rel="noopener" className="font-medium text-blue-700 text-sm hover:underline flex-1">
+                                            {rec.title}
+                                        </a>
+                                        <span className="text-xs bg-white px-2 py-0.5 rounded border border-blue-100 text-slate-500">{rec.year}</span>
+                                    </div>
+                                    <p className="text-xs text-slate-600">{rec.reason}</p>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const IntegrityWidget: React.FC<{ report: IntegrityReport }> = ({ report }) => {
+    const [isOpen, setIsOpen] = useState(false);
+
+    return (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden mt-4">
+             <button 
+                onClick={() => setIsOpen(!isOpen)}
+                className="w-full flex items-center justify-between p-4 bg-slate-50 hover:bg-slate-100 transition-colors"
+            >
+                <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center ${report.hasIssues ? 'bg-red-100 text-red-600' : 'bg-blue-100 text-blue-600'}`}>
+                        <i className={`fas ${report.hasIssues ? 'fa-triangle-exclamation' : 'fa-shield-halved'}`}></i>
+                    </div>
+                    <div className="text-left">
+                        <h3 className="font-bold text-slate-800 text-sm">Author & Institution Integrity</h3>
+                        <p className="text-xs text-slate-500">{report.hasIssues ? "Potential issues detected" : "No flagged records"}</p>
+                    </div>
+                </div>
+                <i className={`fas fa-chevron-down text-slate-400 transition-transform ${isOpen ? 'rotate-180' : ''}`}></i>
+            </button>
+            
+            {isOpen && (
+                <div className="p-5 border-t border-slate-100 bg-white animate-fade-in">
+                    <p className="text-slate-700 text-sm leading-relaxed">
+                        {report.summary}
+                    </p>
+                    <div className="mt-3 text-[10px] text-slate-400 italic">
+                        * Automated check based on public search records. Verify independently.
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+// --- Main App ---
+
 const App: React.FC = () => {
   const [query, setQuery] = useState('');
   const [loadingState, setLoadingState] = useState<LoadingState>(LoadingState.IDLE);
@@ -92,28 +179,39 @@ const App: React.FC = () => {
   
   // History Management State
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [deletedHistory, setDeletedHistory] = useState<HistoryItem[]>([]);
   const [currentHistoryId, setCurrentHistoryId] = useState<string | null>(null);
   const [currentPaperTitle, setCurrentPaperTitle] = useState<string | null>(null);
   
-  // Delete Modal State
+  // Delete Modal & Recycle Bin State
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'single' | 'all', id?: string } | null>(null);
+  const [isRecycleBinOpen, setIsRecycleBinOpen] = useState(false);
 
   // Trend Analysis State
   const [isTrendModalOpen, setIsTrendModalOpen] = useState(false);
   const [trendReport, setTrendReport] = useState<string | null>(null);
   const [trendLoading, setTrendLoading] = useState(false);
 
+  // Secondary Analysis States
+  const [timelinessReport, setTimelinessReport] = useState<TimelinessReport | null>(null);
+  const [integrityReport, setIntegrityReport] = useState<IntegrityReport | null>(null);
+  
+  // Abort Controller Ref
+  const abortControllerRef = useRef<AbortController | null>(null);
+
   // Load history on mount
   useEffect(() => {
     try {
       const saved = localStorage.getItem(HISTORY_KEY);
       if (saved) {
-        const parsed = JSON.parse(saved);
-        setHistory(parsed);
+        setHistory(JSON.parse(saved));
+      }
+      const savedDeleted = localStorage.getItem(DELETED_HISTORY_KEY);
+      if (savedDeleted) {
+        setDeletedHistory(JSON.parse(savedDeleted));
       }
     } catch (e) {
       console.error("Failed to load history", e);
-      localStorage.removeItem(HISTORY_KEY);
     }
   }, []);
 
@@ -122,6 +220,12 @@ const App: React.FC = () => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(newHistory));
   };
 
+  const saveDeletedHistoryState = (newDeletedHistory: HistoryItem[]) => {
+    setDeletedHistory(newDeletedHistory);
+    localStorage.setItem(DELETED_HISTORY_KEY, JSON.stringify(newDeletedHistory));
+  };
+
+  // ... (Previous Delete/Recycle Bin functions remain same) ...
   const requestDeleteHistoryItem = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     e.preventDefault();
@@ -140,29 +244,65 @@ const App: React.FC = () => {
     if (!deleteTarget) return;
 
     if (deleteTarget.type === 'all') {
-        localStorage.removeItem(HISTORY_KEY);
-        setHistory([]);
+        const timestamp = Date.now();
+        const itemsToRecycle = history.map(h => ({ ...h, deletedAt: timestamp })); 
+        const newDeleted = [...itemsToRecycle, ...deletedHistory];
+        saveDeletedHistoryState(newDeleted);
+
+        saveHistoryState([]);
         setResult(null);
         setChatMessages([]);
         setCurrentPaperTitle(null);
         setCurrentHistoryId(null);
+        setTimelinessReport(null);
+        setIntegrityReport(null);
         setLoadingState(LoadingState.IDLE);
     } else if (deleteTarget.type === 'single' && deleteTarget.id) {
         const id = deleteTarget.id;
-        const newHistory = history.filter((item: HistoryItem) => String(item.id) !== String(id));
+        const itemToDelete = history.find(item => item.id === id);
         
-        saveHistoryState(newHistory);
+        if (itemToDelete) {
+             const newDeleted = [itemToDelete, ...deletedHistory];
+             saveDeletedHistoryState(newDeleted);
+             const newHistory = history.filter((item: HistoryItem) => String(item.id) !== String(id));
+             saveHistoryState(newHistory);
+        }
 
         if (currentHistoryId === id) {
           setResult(null);
           setChatMessages([]);
           setCurrentPaperTitle(null);
           setCurrentHistoryId(null);
+          setTimelinessReport(null);
+          setIntegrityReport(null);
           setLoadingState(LoadingState.IDLE);
         }
     }
 
     setDeleteTarget(null);
+  };
+
+  // Recycle Bin Actions
+  const handleRestoreItem = (id: string) => {
+      const itemToRestore = deletedHistory.find(item => item.id === id);
+      if (!itemToRestore) return;
+
+      const newHistory = [itemToRestore, ...history];
+      saveHistoryState(newHistory);
+
+      const newDeleted = deletedHistory.filter(item => item.id !== id);
+      saveDeletedHistoryState(newDeleted);
+  };
+
+  const handlePermanentDelete = (id: string) => {
+      if (!window.confirm("Permanently delete this item? This cannot be undone.")) return;
+      const newDeleted = deletedHistory.filter(item => item.id !== id);
+      saveDeletedHistoryState(newDeleted);
+  };
+
+  const handleEmptyRecycleBin = () => {
+      if (!window.confirm("Permanently delete all items in Recycle Bin?")) return;
+      saveDeletedHistoryState([]);
   };
 
   const clearCurrentChat = () => {
@@ -187,31 +327,72 @@ const App: React.FC = () => {
     setChatMessages(item.chatMessages);
     setCurrentPaperTitle(item.title);
     setCurrentHistoryId(item.id);
+    setTimelinessReport(null); // Simple restore doesn't re-run checks
+    setIntegrityReport(null);
     setError(null);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  // --- Main Logic Update ---
+
+  const abortAnalysis = () => {
+    if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+        setLoadingState(LoadingState.IDLE);
+    }
+  };
+
+  const runSecondaryChecks = async (markdown: string) => {
+      // Extract metadata via regex
+      const titleMatch = markdown.match(/^标题:\s*(.+)$/m) || markdown.match(/\*\*标题\*\*:\s*(.+)/);
+      const title = titleMatch ? titleMatch[1].trim() : "Unknown Paper";
+      
+      const authorMatch = markdown.match(/^作者:\s*(.+)$/m) || markdown.match(/\*\*作者\*\*:\s*(.+)/);
+      const authors = authorMatch ? authorMatch[1].trim() : "";
+      
+      const yearMatch = markdown.match(/^发表年份.*:\s*(.+)$/m);
+      const year = yearMatch ? yearMatch[1].trim() : "";
+
+      // Run parallel checks
+      const [tReport, iReport] = await Promise.all([
+         checkPaperTimeliness(title, `${authors} ${year}`),
+         checkAuthorIntegrity(authors)
+      ]);
+
+      setTimelinessReport(tReport);
+      setIntegrityReport(iReport);
   };
 
   const performAnalysis = async (searchQuery: string) => {
     if (!searchQuery.trim()) return;
 
+    // Abort previous if any
+    if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoadingState(LoadingState.ANALYZING);
     setError(null);
     setResult(null);
+    setTimelinessReport(null);
+    setIntegrityReport(null);
     setCopied(false);
     setChatMessages([]);
     setCurrentPaperTitle(null);
     setCurrentHistoryId(null);
 
     try {
-      const data = await analyzePaperWithGemini(searchQuery);
+      const data = await analyzePaperWithGemini(searchQuery, controller.signal);
       
-      // Extract title
       const titleMatch = data.markdown.match(/^标题:\s*(.+)$/m) || data.markdown.match(/\*\*标题\*\*:\s*(.+)/);
       const title = titleMatch ? titleMatch[1].trim() : searchQuery;
       const cleanTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5\s\-:(),.]/g, '').trim();
       const finalTitle = cleanTitle || "Untitled Analysis";
 
-      // Create new History Item
       const newId = Date.now().toString();
       const newItem: HistoryItem = {
         id: newId,
@@ -221,7 +402,6 @@ const App: React.FC = () => {
         chatMessages: []
       };
 
-      // Add to history (remove old duplicate if exists to push new one to top)
       const newHistory = [newItem, ...history.filter(h => h.title !== finalTitle)];
       saveHistoryState(newHistory);
 
@@ -229,8 +409,16 @@ const App: React.FC = () => {
       setCurrentPaperTitle(finalTitle);
       setCurrentHistoryId(newId);
       setLoadingState(LoadingState.COMPLETED);
+      
+      // Run sub-agents after main success
+      runSecondaryChecks(data.markdown);
 
-    } catch (err) {
+    } catch (err: any) {
+      if (err.message?.includes("Aborted") || err.message?.includes("stopped by the user")) {
+          // Handled by abort action usually, but ensure state is correct
+          setLoadingState(LoadingState.IDLE);
+          return;
+      }
       console.error(err);
       setError("Failed to analyze the paper. Please try a different query or check your API key.");
       setLoadingState(LoadingState.ERROR);
@@ -251,8 +439,6 @@ const App: React.FC = () => {
 
   const handleChatUpdate = (newMessages: ChatMessage[]) => {
     setChatMessages(newMessages);
-    
-    // Update the specific history item with new messages
     if (currentHistoryId) {
       const newHistory = history.map(item => {
         if (item.id === currentHistoryId) {
@@ -304,8 +490,6 @@ const App: React.FC = () => {
     if (history.length === 0) return;
     
     setIsTrendModalOpen(true);
-    // If we already have a report, don't regenerate automatically unless explicitly asked (future improvement)
-    // For now, let's regenerate to include latest data
     setTrendLoading(true);
     setTrendReport(null);
 
@@ -326,6 +510,7 @@ const App: React.FC = () => {
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50">
         <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3 cursor-pointer" onClick={() => {
+            if (abortControllerRef.current) abortControllerRef.current.abort();
             setLoadingState(LoadingState.IDLE);
             setResult(null);
             window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -384,17 +569,25 @@ const App: React.FC = () => {
             </div>
           </form>
 
-          {/* Recent History on Idle Screen */}
+          {/* Recent History / Suggestions Logic ... (Kept same as before) */}
           {!result && loadingState === LoadingState.IDLE && history.length > 0 && (
-            <div className="mt-12 max-w-2xl mx-auto animate-fade-in-up">
+             <div className="mt-12 max-w-2xl mx-auto animate-fade-in-up">
                <div className="flex items-center justify-between mb-4 px-1">
                   <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider">Recent Research</h3>
-                  <button 
-                    onClick={handleTrendAnalysis}
-                    className="text-sm text-blue-600 font-medium hover:text-blue-800 hover:underline flex items-center gap-1"
-                  >
-                    <i className="fas fa-chart-line"></i> Analyze Trends
-                  </button>
+                  <div className="flex items-center gap-4">
+                    <button 
+                        onClick={() => setIsRecycleBinOpen(true)}
+                        className="text-sm text-slate-400 hover:text-slate-600 flex items-center gap-1 transition-colors"
+                    >
+                        <i className="fas fa-trash-restore"></i> Recycle Bin
+                    </button>
+                    <button 
+                        onClick={handleTrendAnalysis}
+                        className="text-sm text-blue-600 font-medium hover:text-blue-800 hover:underline flex items-center gap-1"
+                    >
+                        <i className="fas fa-chart-line"></i> Analyze Trends
+                    </button>
+                  </div>
                </div>
                <div className="space-y-3">
                  {history.slice(0, 3).map(item => (
@@ -403,7 +596,6 @@ const App: React.FC = () => {
                       onClick={() => restoreHistoryItem(item)}
                       className="group flex items-center justify-between p-4 bg-white border border-slate-200 rounded-xl hover:border-blue-300 hover:shadow-md transition-all cursor-pointer text-left"
                    >
-                     {/* Content Left (Flex Grow) */}
                      <div className="flex items-center gap-3 overflow-hidden flex-1 min-w-0">
                         <div className="w-10 h-10 bg-blue-50 text-blue-600 rounded-lg flex-shrink-0 flex items-center justify-center">
                           <i className="fas fa-file-alt"></i>
@@ -413,16 +605,11 @@ const App: React.FC = () => {
                            <p className="text-xs text-slate-500">{new Date(item.timestamp).toLocaleDateString()}</p>
                         </div>
                      </div>
-                     
-                     {/* Actions Right (Flex None) - Guaranteed No Overlap */}
                      <div className="flex items-center gap-2 pl-4 flex-none">
-                        <i className="fas fa-arrow-right text-slate-300 group-hover:text-blue-500 transition-all transform -translate-x-2 opacity-0 group-hover:opacity-100 group-hover:translate-x-0"></i>
-                        
                         <button
                           type="button"
                           onClick={(e) => requestDeleteHistoryItem(e, item.id)}
                           className="p-2 text-slate-300 hover:bg-red-50 hover:text-red-500 rounded-lg transition-all opacity-0 group-hover:opacity-100 relative z-20"
-                          title="Delete record"
                         >
                            <i className="fas fa-trash-alt"></i>
                         </button>
@@ -433,30 +620,40 @@ const App: React.FC = () => {
             </div>
           )}
 
-          {/* Suggestions - Only show when idle and no history (or below history) */}
           {!result && loadingState === LoadingState.IDLE && history.length === 0 && (
-            <div className="mt-8 flex flex-wrap justify-center gap-3 animate-fade-in-up">
-              <span className="text-sm text-slate-400 py-1">Try asking:</span>
-              {[
-                "Attention Is All You Need",
-                "Deep Residual Learning for Image Recognition",
-                "LoRA: Low-Rank Adaptation of LLMs"
-              ].map((suggestion, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => handleSuggestionClick(suggestion)}
-                  className="px-3 py-1 bg-white border border-slate-200 rounded-full text-sm text-slate-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 transition-all cursor-pointer"
-                >
-                  {suggestion}
-                </button>
-              ))}
+            <div className="mt-8 animate-fade-in-up">
+              <div className="flex flex-wrap justify-center gap-3">
+                <span className="text-sm text-slate-400 py-1">Try asking:</span>
+                {[
+                  "Attention Is All You Need",
+                  "Deep Residual Learning for Image Recognition",
+                  "LoRA: Low-Rank Adaptation of LLMs"
+                ].map((suggestion, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => handleSuggestionClick(suggestion)}
+                    className="px-3 py-1 bg-white border border-slate-200 rounded-full text-sm text-slate-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 transition-all cursor-pointer"
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+              <div className="mt-6 flex justify-center">
+                  <button 
+                      onClick={() => setIsRecycleBinOpen(true)}
+                      className={`text-slate-400 hover:text-slate-600 text-sm flex items-center gap-2 px-4 py-2 rounded-lg hover:bg-slate-100 transition-colors ${deletedHistory.length === 0 ? 'opacity-60' : ''}`}
+                  >
+                      <i className="fas fa-trash-restore"></i>
+                      <span>Recycle Bin ({deletedHistory.length})</span>
+                  </button>
+              </div>
             </div>
           )}
         </section>
 
         {/* Content Area */}
         <div className="min-h-[400px]">
-          {loadingState === LoadingState.ANALYZING && <LoadingView />}
+          {loadingState === LoadingState.ANALYZING && <LoadingView onCancel={abortAnalysis} />}
 
           {loadingState === LoadingState.ERROR && (
              <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-center text-red-700 max-w-2xl mx-auto animate-fade-in">
@@ -475,7 +672,13 @@ const App: React.FC = () => {
                   <div id="analysis-content">
                     <AnalysisDisplay content={result.markdown} />
                     
-                    {/* Discussion History for PDF Export */}
+                    {/* NEW: Secondary Analysis Widgets */}
+                    <div className="print:hidden">
+                        {timelinessReport && <TimelinessWidget report={timelinessReport} />}
+                        {integrityReport && <IntegrityWidget report={integrityReport} />}
+                    </div>
+
+                    {/* Discussion History */}
                     {chatMessages.length > 0 && (
                       <div className="mt-12 border-t-2 border-slate-100 pt-8">
                          <div className="flex items-center justify-between mb-6">
@@ -515,24 +718,33 @@ const App: React.FC = () => {
 
                 {/* Sidebar / Metadata Column */}
                 <div className="lg:col-span-4 space-y-6">
-                  
-                  {/* Research History Widget (New) */}
+                  {/* ... (Keep Sidebar widgets as is) ... */}
                   <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 max-h-[500px] overflow-y-auto relative">
                     <div className="sticky top-0 bg-white z-10 pb-2 border-b border-slate-100 mb-3 space-y-2">
                        <div className="flex items-center justify-between">
                          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
                            <i className="fas fa-history"></i> Research History
                          </h3>
-                         {history.length > 0 && (
-                           <button 
-                             type="button"
-                             onClick={(e) => requestClearAllHistory(e)}
-                             className="text-[10px] text-slate-400 hover:text-red-500 flex items-center gap-1 transition-colors px-2 py-1 rounded hover:bg-slate-100 cursor-pointer"
-                             title="Clear all history"
-                           >
-                             <i className="fas fa-trash"></i> Clear All
-                           </button>
-                         )}
+                         <div className="flex items-center gap-2">
+                            <button 
+                                type="button" 
+                                onClick={() => setIsRecycleBinOpen(true)}
+                                className="text-slate-400 hover:text-blue-600 transition-colors p-1"
+                                title="Open Recycle Bin"
+                            >
+                                <i className="fas fa-trash-restore"></i>
+                            </button>
+                            {history.length > 0 && (
+                                <button 
+                                    type="button"
+                                    onClick={(e) => requestClearAllHistory(e)}
+                                    className="text-[10px] text-slate-400 hover:text-red-500 flex items-center gap-1 transition-colors px-2 py-1 rounded hover:bg-slate-100 cursor-pointer"
+                                    title="Clear all history"
+                                >
+                                    <i className="fas fa-trash"></i> Clear All
+                                </button>
+                            )}
+                         </div>
                        </div>
                        
                        <button 
@@ -568,13 +780,11 @@ const App: React.FC = () => {
                                       {new Date(item.timestamp).toLocaleDateString()} • {item.chatMessages.length} msgs
                                    </div>
                                 </div>
-                                
                                 <div className="flex-none pr-2">
                                     <button 
                                       type="button"
                                       onClick={(e) => requestDeleteHistoryItem(e, item.id)}
                                       className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-100 rounded-lg transition-all"
-                                      title="Delete from history"
                                     >
                                        <i className="fas fa-trash-alt"></i>
                                     </button>
@@ -629,7 +839,6 @@ const App: React.FC = () => {
                         <i className={`fas ${copied ? 'fa-check' : 'fa-copy'}`}></i>
                         {copied ? 'Copied to Clipboard' : 'Copy Analysis'}
                       </button>
-
                       <button 
                         onClick={handlePrint}
                         className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-slate-200 text-slate-600 text-sm hover:bg-slate-50 hover:text-slate-900 transition-colors"
@@ -653,7 +862,7 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {/* Delete Confirmation Modal */}
+      {/* Delete Modal & Recycle Bin Modal (Kept same as before) */}
       {deleteTarget && (
         <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
            <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 transform transition-all scale-100">
@@ -663,16 +872,14 @@ const App: React.FC = () => {
                  </div>
                  <div>
                     <h3 className="text-lg font-bold text-slate-900">Confirm Deletion</h3>
-                    <p className="text-sm text-slate-500">This action cannot be undone.</p>
+                    <p className="text-sm text-slate-500">Items will be moved to Recycle Bin.</p>
                  </div>
               </div>
-              
               <p className="text-slate-600 mb-6 leading-relaxed">
                  {deleteTarget.type === 'all' 
                     ? "Are you sure you want to delete ALL research history?" 
-                    : "Are you sure you want to delete this analysis permanently?"}
+                    : "Are you sure you want to delete this analysis?"}
               </p>
-              
               <div className="flex items-center justify-end gap-3">
                  <button 
                     onClick={() => setDeleteTarget(null)}
@@ -691,11 +898,82 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Trend Report Modal */}
+      {isRecycleBinOpen && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
+           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
+               <div className="p-5 border-b border-slate-100 flex items-center justify-between bg-white">
+                  <div className="flex items-center gap-3">
+                     <div className="w-10 h-10 bg-slate-100 rounded-lg flex items-center justify-center text-slate-600">
+                        <i className="fas fa-trash-restore text-lg"></i>
+                     </div>
+                     <div>
+                        <h2 className="text-xl font-bold text-slate-800">Recycle Bin</h2>
+                        <p className="text-xs text-slate-500">{deletedHistory.length} items</p>
+                     </div>
+                  </div>
+                  <button 
+                    onClick={() => setIsRecycleBinOpen(false)}
+                    className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
+                  >
+                    <i className="fas fa-times text-lg"></i>
+                  </button>
+               </div>
+               <div className="flex-1 overflow-y-auto p-4 bg-slate-50">
+                  {deletedHistory.length === 0 ? (
+                      <div className="h-48 flex flex-col items-center justify-center text-slate-400">
+                          <i className="fas fa-trash-alt text-4xl mb-3 opacity-50"></i>
+                          <p>Recycle Bin is empty</p>
+                      </div>
+                  ) : (
+                      <div className="space-y-3">
+                          {deletedHistory.map(item => (
+                             <div key={item.id} className="bg-white p-4 rounded-xl border border-slate-200 flex items-center justify-between gap-4 shadow-sm">
+                                <div className="min-w-0">
+                                   <h4 className="font-medium text-slate-800 truncate">{item.title}</h4>
+                                   <p className="text-xs text-slate-400">Original Date: {new Date(item.timestamp).toLocaleDateString()}</p>
+                                </div>
+                                <div className="flex items-center gap-2 flex-shrink-0">
+                                   <button 
+                                      onClick={() => handleRestoreItem(item.id)}
+                                      className="p-2 text-green-600 hover:bg-green-50 rounded-lg transition-colors flex items-center gap-1 text-xs font-medium border border-transparent hover:border-green-200"
+                                   >
+                                      <i className="fas fa-trash-arrow-up"></i> Restore
+                                   </button>
+                                   <button 
+                                      onClick={() => handlePermanentDelete(item.id)}
+                                      className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors flex items-center gap-1 text-xs font-medium border border-transparent hover:border-red-200"
+                                   >
+                                      <i className="fas fa-times"></i> Delete
+                                   </button>
+                                </div>
+                             </div>
+                          ))}
+                      </div>
+                  )}
+               </div>
+               <div className="p-4 border-t border-slate-100 bg-white flex justify-between items-center">
+                  <button 
+                     onClick={handleEmptyRecycleBin}
+                     disabled={deletedHistory.length === 0}
+                     className="px-4 py-2 text-red-600 text-sm font-medium hover:bg-red-50 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                     Empty Recycle Bin
+                  </button>
+                  <button 
+                     onClick={() => setIsRecycleBinOpen(false)}
+                     className="px-6 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-medium transition-colors"
+                  >
+                     Close
+                  </button>
+               </div>
+           </div>
+        </div>
+      )}
+
+      {/* Trend Report Modal (Kept same as before) */}
       {isTrendModalOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden">
-            {/* Modal Header */}
             <div className="p-5 border-b border-slate-100 flex items-center justify-between bg-white">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-indigo-500/20">
@@ -714,7 +992,6 @@ const App: React.FC = () => {
                       ? 'bg-green-50 border-green-200 text-green-700'
                       : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 hover:text-blue-600'
                   }`}
-                  title="Copy raw markdown code"
                 >
                   <i className={`fas ${reportCopied ? 'fa-check' : 'fa-code'} mr-1`}></i>
                   {reportCopied ? 'Copied' : 'Copy MD'}
@@ -728,7 +1005,6 @@ const App: React.FC = () => {
               </div>
             </div>
             
-            {/* Modal Content */}
             <div className="flex-1 overflow-y-auto p-6 bg-slate-50">
                {trendLoading ? (
                  <div className="flex flex-col items-center justify-center h-64 space-y-4">
@@ -744,7 +1020,6 @@ const App: React.FC = () => {
                )}
             </div>
 
-            {/* Modal Footer */}
             <div className="p-4 border-t border-slate-100 bg-white flex justify-end">
                <button 
                  onClick={() => {
