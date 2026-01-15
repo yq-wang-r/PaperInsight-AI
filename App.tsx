@@ -94,6 +94,9 @@ const App: React.FC = () => {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [currentHistoryId, setCurrentHistoryId] = useState<string | null>(null);
   const [currentPaperTitle, setCurrentPaperTitle] = useState<string | null>(null);
+  
+  // Delete Modal State
+  const [deleteTarget, setDeleteTarget] = useState<{ type: 'single' | 'all', id?: string } | null>(null);
 
   // Trend Analysis State
   const [isTrendModalOpen, setIsTrendModalOpen] = useState(false);
@@ -105,10 +108,12 @@ const App: React.FC = () => {
     try {
       const saved = localStorage.getItem(HISTORY_KEY);
       if (saved) {
-        setHistory(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        setHistory(parsed);
       }
     } catch (e) {
       console.error("Failed to load history", e);
+      localStorage.removeItem(HISTORY_KEY);
     }
   }, []);
 
@@ -117,44 +122,47 @@ const App: React.FC = () => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(newHistory));
   };
 
-  const deleteHistoryItem = (e: React.MouseEvent, id: string) => {
-    // CRITICAL: Stop propagation to prevent opening the item
+  const requestDeleteHistoryItem = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
-    e.preventDefault(); 
-    
-    if (!window.confirm("Are you sure you want to delete this analysis permanently?")) return;
-    
-    // Use synchronous update based on current render scope to avoid race conditions
-    // Cast IDs to string to ensure safe comparison even if legacy data has numbers
-    const newHistory = history.filter(item => String(item.id) !== String(id));
-    
-    setHistory(newHistory);
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(newHistory));
-    
-    if (currentHistoryId === id) {
-       // If deleting current, reset view to home
-       setResult(null);
-       setChatMessages([]);
-       setCurrentPaperTitle(null);
-       setCurrentHistoryId(null);
-       setLoadingState(LoadingState.IDLE);
-    }
+    e.preventDefault();
+    setDeleteTarget({ type: 'single', id });
   };
   
-  const clearAllHistory = (e?: React.MouseEvent) => {
+  const requestClearAllHistory = (e?: React.MouseEvent) => {
       if (e) {
           e.stopPropagation();
           e.preventDefault();
       }
-      
-      if (!window.confirm("Are you sure you want to delete ALL research history? This cannot be undone.")) return;
-      
-      saveHistoryState([]);
-      setResult(null);
-      setChatMessages([]);
-      setCurrentPaperTitle(null);
-      setCurrentHistoryId(null);
-      setLoadingState(LoadingState.IDLE);
+      setDeleteTarget({ type: 'all' });
+  };
+
+  const confirmDelete = () => {
+    if (!deleteTarget) return;
+
+    if (deleteTarget.type === 'all') {
+        localStorage.removeItem(HISTORY_KEY);
+        setHistory([]);
+        setResult(null);
+        setChatMessages([]);
+        setCurrentPaperTitle(null);
+        setCurrentHistoryId(null);
+        setLoadingState(LoadingState.IDLE);
+    } else if (deleteTarget.type === 'single' && deleteTarget.id) {
+        const id = deleteTarget.id;
+        const newHistory = history.filter((item: HistoryItem) => String(item.id) !== String(id));
+        
+        saveHistoryState(newHistory);
+
+        if (currentHistoryId === id) {
+          setResult(null);
+          setChatMessages([]);
+          setCurrentPaperTitle(null);
+          setCurrentHistoryId(null);
+          setLoadingState(LoadingState.IDLE);
+        }
+    }
+
+    setDeleteTarget(null);
   };
 
   const clearCurrentChat = () => {
@@ -412,7 +420,7 @@ const App: React.FC = () => {
                         
                         <button
                           type="button"
-                          onClick={(e) => deleteHistoryItem(e, item.id)}
+                          onClick={(e) => requestDeleteHistoryItem(e, item.id)}
                           className="p-2 text-slate-300 hover:bg-red-50 hover:text-red-500 rounded-lg transition-all opacity-0 group-hover:opacity-100 relative z-20"
                           title="Delete record"
                         >
@@ -518,8 +526,8 @@ const App: React.FC = () => {
                          {history.length > 0 && (
                            <button 
                              type="button"
-                             onClick={(e) => clearAllHistory(e)}
-                             className="text-[10px] text-slate-400 hover:text-red-500 flex items-center gap-1 transition-colors"
+                             onClick={(e) => requestClearAllHistory(e)}
+                             className="text-[10px] text-slate-400 hover:text-red-500 flex items-center gap-1 transition-colors px-2 py-1 rounded hover:bg-slate-100 cursor-pointer"
                              title="Clear all history"
                            >
                              <i className="fas fa-trash"></i> Clear All
@@ -547,10 +555,12 @@ const App: React.FC = () => {
                           history.map(item => (
                              <div 
                                key={item.id} 
-                               onClick={() => restoreHistoryItem(item)}
-                               className={`group relative p-3 rounded-lg border transition-all cursor-pointer flex items-center justify-between overflow-hidden ${currentHistoryId === item.id ? 'bg-blue-50 border-blue-200 shadow-inner' : 'bg-white border-slate-100 hover:border-blue-200 hover:bg-slate-50'}`}
+                               className={`group flex items-center justify-between rounded-lg border transition-all overflow-hidden ${currentHistoryId === item.id ? 'bg-blue-50 border-blue-200 shadow-inner' : 'bg-white border-slate-100 hover:border-blue-200 hover:bg-slate-50'}`}
                              >
-                                <div className="min-w-0 pr-8 z-0">
+                                <div 
+                                    onClick={() => restoreHistoryItem(item)}
+                                    className="flex-1 min-w-0 p-3 cursor-pointer"
+                                >
                                    <div className={`text-sm font-medium truncate ${currentHistoryId === item.id ? 'text-blue-800' : 'text-slate-700'}`}>
                                       {item.title}
                                    </div>
@@ -559,14 +569,16 @@ const App: React.FC = () => {
                                    </div>
                                 </div>
                                 
-                                <button 
-                                  type="button"
-                                  onClick={(e) => deleteHistoryItem(e, item.id)}
-                                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-full transition-all z-20"
-                                  title="Delete from history"
-                                >
-                                   <i className="fas fa-trash-alt"></i>
-                                </button>
+                                <div className="flex-none pr-2">
+                                    <button 
+                                      type="button"
+                                      onClick={(e) => requestDeleteHistoryItem(e, item.id)}
+                                      className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-100 rounded-lg transition-all"
+                                      title="Delete from history"
+                                    >
+                                       <i className="fas fa-trash-alt"></i>
+                                    </button>
+                                </div>
                              </div>
                           ))
                        )}
@@ -640,6 +652,44 @@ const App: React.FC = () => {
           )}
         </div>
       </main>
+
+      {/* Delete Confirmation Modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
+           <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 transform transition-all scale-100">
+              <div className="flex items-center gap-4 mb-4">
+                 <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center text-red-600 flex-shrink-0">
+                    <i className="fas fa-exclamation-triangle text-xl"></i>
+                 </div>
+                 <div>
+                    <h3 className="text-lg font-bold text-slate-900">Confirm Deletion</h3>
+                    <p className="text-sm text-slate-500">This action cannot be undone.</p>
+                 </div>
+              </div>
+              
+              <p className="text-slate-600 mb-6 leading-relaxed">
+                 {deleteTarget.type === 'all' 
+                    ? "Are you sure you want to delete ALL research history?" 
+                    : "Are you sure you want to delete this analysis permanently?"}
+              </p>
+              
+              <div className="flex items-center justify-end gap-3">
+                 <button 
+                    onClick={() => setDeleteTarget(null)}
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-medium transition-colors"
+                 >
+                    Cancel
+                 </button>
+                 <button 
+                    onClick={confirmDelete}
+                    className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors shadow-sm"
+                 >
+                    Delete
+                 </button>
+              </div>
+           </div>
+        </div>
+      )}
 
       {/* Trend Report Modal */}
       {isTrendModalOpen && (
