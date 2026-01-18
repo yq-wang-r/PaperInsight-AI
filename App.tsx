@@ -1312,7 +1312,7 @@ const App: React.FC = () => {
             >
               <i className="fas fa-cog text-lg"></i>
             </button>
-            <a href="https://github.com/YourUsername/PaperInsight-AI" target="_blank" rel="noreferrer" className="w-10 h-10 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all">
+            <a href="https://github.com/yq-wang-r/PaperInsight-AI" target="_blank" rel="noreferrer" className="w-10 h-10 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all">
               <i className="fab fa-github text-lg"></i>
             </a>
           </div>
