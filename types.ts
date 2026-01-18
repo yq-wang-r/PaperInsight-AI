@@ -68,3 +68,10 @@ export enum LoadingState {
   COMPLETED = 'COMPLETED',
   ERROR = 'ERROR',
 }
+
+export interface ApiConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  apiType: 'gemini' | 'openai';
+}

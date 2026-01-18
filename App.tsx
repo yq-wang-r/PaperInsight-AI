@@ -1,10 +1,27 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { analyzePaperWithGemini, analyzeTrendsWithGemini, checkPaperTimeliness, checkAuthorIntegrity, checkVenueQuality } from './services/geminiService';
+import { getApiConfig } from './services/openAIService';
+import {
+  analyzePaperWithGemini,
+  analyzeTrendsWithGemini,
+  checkPaperTimeliness,
+  checkAuthorIntegrity,
+  checkVenueQuality,
+  askFollowUp as askFollowUpGemini
+} from './services/geminiService';
+import {
+  analyzePaperWithOpenAI,
+  analyzeTrendsWithOpenAI,
+  checkPaperTimelinessWithOpenAI,
+  checkAuthorIntegrityWithOpenAI,
+  checkVenueQualityWithOpenAI,
+  askFollowUpWithOpenAI
+} from './services/openAIService';
 import { AnalysisResult, LoadingState, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport, VenueReport } from './types';
 import AnalysisDisplay from './components/AnalysisDisplay';
 import LoadingView from './components/LoadingView';
 import ChatInterface from './components/ChatInterface';
 import MarkdownRenderer from './components/MarkdownRenderer';
+import SettingsModal from './components/SettingsModal';
 
 const HISTORY_KEY = 'paper_insight_history_v1';
 const DELETED_HISTORY_KEY = 'paper_insight_deleted_history_v1';
@@ -421,6 +438,64 @@ const App: React.FC = () => {
   // Clear Chat Modal State
   const [isClearChatModalOpen, setIsClearChatModalOpen] = useState(false);
 
+  // Settings Modal State
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+
+  // Helper function to choose API based on config
+  const getApiService = () => {
+    const config = getApiConfig();
+    return config.apiType;
+  };
+
+  // Wrapper functions that call appropriate API
+  const analyzePaper = async (
+    query: string,
+    signal?: AbortSignal,
+    pdfBase64?: string,
+    enableSearch?: boolean
+  ): Promise<AnalysisResult> => {
+    const apiType = getApiService();
+    return apiType === 'gemini'
+      ? analyzePaperWithGemini(query, signal, pdfBase64, enableSearch)
+      : analyzePaperWithOpenAI(query, signal, pdfBase64, enableSearch);
+  };
+
+  const checkTimeliness = async (title: string, authorAndYear: string): Promise<TimelinessReport> => {
+    const apiType = getApiService();
+    return apiType === 'gemini'
+      ? checkPaperTimeliness(title, authorAndYear)
+      : checkPaperTimelinessWithOpenAI(title, authorAndYear);
+  };
+
+  const checkVenue = async (venueText: string): Promise<VenueReport> => {
+    const apiType = getApiService();
+    return apiType === 'gemini'
+      ? checkVenueQuality(venueText)
+      : checkVenueQualityWithOpenAI(venueText);
+  };
+
+  const checkIntegrity = async (authors: string): Promise<IntegrityReport> => {
+    const apiType = getApiService();
+    return apiType === 'gemini'
+      ? checkAuthorIntegrity(authors)
+      : checkAuthorIntegrityWithOpenAI(authors);
+  };
+
+  const analyzeTrends = async (history: HistoryItem[]): Promise<string> => {
+    const apiType = getApiService();
+    return apiType === 'gemini'
+      ? analyzeTrendsWithGemini(history)
+      : analyzeTrendsWithOpenAI(history);
+  };
+
+  // Wrapper function for both API types
+  const askFollowUp = async (question: string, originalContext: string, messages: ChatMessage[]): Promise<string> => {
+    const apiType = getApiService();
+    return apiType === 'gemini'
+      ? askFollowUpGemini(question, originalContext, messages)
+      : askFollowUpWithOpenAI(question, originalContext, messages);
+  };
+
   // Trend Analysis State
   const [trendReport, setTrendReport] = useState<string | null>(null);
   const [trendLoading, setTrendLoading] = useState(false);
@@ -788,7 +863,7 @@ const App: React.FC = () => {
     const yearMatch = result.markdown.match(/^发表年份.*:\s*(.+)$/m);
     const year = yearMatch ? yearMatch[1].trim() : "";
 
-    const tReport = await checkPaperTimeliness(title, `${authors} ${year}`);
+    const tReport = await checkTimeliness(title, `${authors} ${year}`);
     
     setHistory(prevHistory => {
         const updated = prevHistory.map(item => {
@@ -864,7 +939,7 @@ const App: React.FC = () => {
     abortControllersRef.current.set(id, controller);
 
     try {
-      const data = await analyzePaperWithGemini(searchQuery, controller.signal, pdfData, enableSearch);
+      const data = await analyzePaper(searchQuery, controller.signal, pdfData, enableSearch);
       
       // Check if task is still valid (wasn't aborted externally)
       if (!abortControllersRef.current.has(id)) return;
@@ -1229,9 +1304,18 @@ const App: React.FC = () => {
               PaperInsight <span className="text-blue-600 font-medium">AI</span>
             </h1>
           </div>
-          <a href="https://github.com/YourUsername/PaperInsight-AI" target="_blank" rel="noreferrer" className="text-slate-400 hover:text-slate-600 transition-colors">
-            <i className="fab fa-github text-xl"></i>
-          </a>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsSettingsModalOpen(true)}
+              className="w-10 h-10 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
+              title="设置"
+            >
+              <i className="fas fa-cog text-lg"></i>
+            </button>
+            <a href="https://github.com/YourUsername/PaperInsight-AI" target="_blank" rel="noreferrer" className="w-10 h-10 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all">
+              <i className="fab fa-github text-lg"></i>
+            </a>
+          </div>
         </div>
       </header>
 
@@ -1990,6 +2074,17 @@ const App: React.FC = () => {
            </div>
         </div>
       )}
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={isSettingsModalOpen}
+        onClose={() => setIsSettingsModalOpen(false)}
+        onSave={(config) => {
+          // Config is already saved in the modal component
+          // We just need to trigger a reload or update if needed
+          window.location.reload();
+        }}
+      />
 
       {/* Footer */}
       <footer className="border-t border-slate-200 py-8 bg-white mt-auto print:hidden">

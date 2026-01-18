@@ -1,44 +1,39 @@
-import { GoogleGenAI, Tool, Part } from "@google/genai";
-import { AnalysisResult, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport, VenueReport, ApiConfig } from "../types";
+import { AnalysisResult, ChatMessage, HistoryItem, TimelinessReport, IntegrityReport, VenueReport } from "../types";
 
-// 默认配置（用于 Gemini）
-const GEMINI_DEFAULT: Pick<ApiConfig, 'apiKey' | 'model'> = {
+// 配置管理接口
+export interface ApiConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  apiType: 'gemini' | 'openai';
+}
+
+// 默认配置
+const DEFAULT_CONFIG: ApiConfig = {
+  baseUrl: 'https://api.siliconflow.cn/v1',
   apiKey: '',
-  model: 'gemini-2.0-flash'
+  model: 'Pro/zai-org/GLM-4.7',
+  apiType: 'openai'
 };
 
 // 获取配置
-const getGeminiConfig = (): Pick<ApiConfig, 'apiKey' | 'model'> => {
-  if (typeof window === 'undefined') return GEMINI_DEFAULT;
+export const getApiConfig = (): ApiConfig => {
+  if (typeof window === 'undefined') return DEFAULT_CONFIG;
   
   try {
     const saved = localStorage.getItem('paper_insight_config');
     if (saved) {
       const parsed = JSON.parse(saved);
       return {
-        ...GEMINI_DEFAULT,
-        apiKey: parsed.apiKey || '',
-        model: parsed.model || 'gemini-2.0-flash'
+        ...DEFAULT_CONFIG,
+        ...parsed
       };
     }
   } catch (e) {
     console.error('Failed to load API config:', e);
   }
   
-  return GEMINI_DEFAULT;
-};
-
-// 创建 Gemini AI 客户端
-const createAIClient = () => {
-  const config = getGeminiConfig();
-  return new GoogleGenAI({
-    apiKey: config.apiKey
-  });
-};
-
-// 获取模型名称
-const getModelName = (): string => {
-  return getGeminiConfig().model;
+  return DEFAULT_CONFIG;
 };
 
 const SYSTEM_INSTRUCTION = `
@@ -69,209 +64,116 @@ Output Format: 请严格按照以下 Markdown 格式输出，不要输出Markdow
 备注: [结合当前计算机领域的技术趋势（如 LLM, Edge AI 等）给出深度的专业评价。]
 `;
 
-/**
- * Robustly extracts the JSON object from a string.
- * Handles cases where the model outputs multiple JSON blocks (e.g. thoughts + result)
- * or includes markdown formatting.
- */
+// OpenAI 兼容 API 调用
+async function callOpenAI(
+  messages: Array<{role: string; content: string}>,
+  config: ApiConfig,
+  options: {
+    temperature?: number;
+    maxTokens?: number;
+    responseFormat?: { type: 'text' | 'json_object' };
+  } = {}
+) {
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${config.apiKey}`
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages,
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.maxTokens ?? 2000,
+      response_format: options.responseFormat
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`API Error (${response.status}): ${error}`);
+  }
+
+  const data = await response.json();
+  return data.choices[0].message.content;
+}
+
+// 提取 JSON 的辅助函数
 const extractJSON = (text: string): any => {
   if (!text) return null;
 
-  // 1. Try cleaning markdown and parsing directly
   const cleanText = text.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
   try {
       return JSON.parse(cleanText);
   } catch (e) {
-      // Continue if simple parse fails
+    // continue
   }
 
-  // 2. Stack-based extractor to find all top-level JSON objects
-  // This handles cases like: { "thought": ... } { "answer": ... }
-  const candidates: any[] = [];
-  let depth = 0;
-  let start = -1;
-  let insideString = false;
-  let escape = false;
-
-  for (let i = 0; i < text.length; i++) {
-      const char = text[i];
-      
-      if (escape) {
-          escape = false;
-          continue;
-      }
-      if (char === '\\') {
-          escape = true;
-          continue;
-      }
-      if (char === '"') {
-          insideString = !insideString;
-          continue;
-      }
-      
-      if (!insideString) {
-          if (char === '{') {
-              if (depth === 0) start = i;
-              depth++;
-          } else if (char === '}') {
-              depth--;
-              if (depth === 0 && start !== -1) {
-                  const chunk = text.substring(start, i + 1);
-                  try {
-                      const parsed = JSON.parse(chunk);
-                      candidates.push(parsed);
-                  } catch (e) {
-                      // ignore invalid chunks
-                  }
-                  start = -1;
-              }
-          }
-      }
-  }
-
-  if (candidates.length > 0) {
-      // Return the last valid JSON object found, as it's typically the final response
-      return candidates[candidates.length - 1];
-  }
-
-  // 3. Last resort: Find first '{' and last '}'
   const firstOpen = text.indexOf('{');
   const lastClose = text.lastIndexOf('}');
   if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
-      try {
-          return JSON.parse(text.substring(firstOpen, lastClose + 1));
-      } catch (e) {
-          return null;
-      }
+    try {
+      return JSON.parse(text.substring(firstOpen, lastClose + 1));
+    } catch (e) {
+      return null;
+    }
   }
 
   return null;
 };
 
-export const analyzePaperWithGemini = async (
-    query: string,
-    signal?: AbortSignal,
-    pdfBase64?: string,
+/**
+ * 使用 OpenAI 兼容 API 分析论文
+ */
+export const analyzePaperWithOpenAI = async (
+    query: string, 
+    signal?: AbortSignal, 
+    pdfBase64?: string, 
     enableSearch: boolean = true
 ): Promise<AnalysisResult> => {
-  const config = getGeminiConfig();
+  const config = getApiConfig();
   if (!config.apiKey) {
     throw new Error("API Key is missing. Please configure it in Settings.");
   }
 
-  const ai = createAIClient();
-
-  // Configure tools based on enableSearch flag
-  const tools: Tool[] = enableSearch ? [{ googleSearch: {} }] : [];
-  
-  // Construct content parts
-  const parts: Part[] = [];
-
+  let userPrompt = '';
   if (pdfBase64) {
-      // PDF Mode: Add the PDF data
-      parts.push({
-          inlineData: {
-              mimeType: 'application/pdf',
-              data: pdfBase64
-          }
-      });
-      // Add a prompt to analyze the attached file
-      const userPrompt = query.trim() 
-          ? `Please analyze this uploaded paper. Focus on this context: "${query}". Strictly follow the defined output format and language rules (Chinese with English terms).` 
-          : `Please analyze this uploaded paper. Strictly follow the defined output format and language rules (Chinese with English terms).`;
-      parts.push({ text: userPrompt });
+    userPrompt = query.trim() 
+        ? `Please analyze this uploaded paper (base64 encoded PDF). Focus on this context: "${query}". Strictly follow the defined output format and language rules (Chinese with English terms).` 
+        : `Please analyze this uploaded paper (base64 encoded PDF). Strictly follow the defined output format and language rules (Chinese with English terms).`;
   } else {
-      // Search Mode: Standard text prompt
-      parts.push({ text: `Search for and analyze the paper related to: "${query}". If multiple papers match, choose the most relevant or influential one. Strictly follow the defined output format and language rules (Chinese with English terms).` });
+    userPrompt = `Search for and analyze the paper related to: "${query}". If multiple papers match, choose the most relevant or influential one. Strictly follow the defined output format and language rules (Chinese with English terms).`;
   }
 
+  const messages = [
+    { role: 'system', content: SYSTEM_INSTRUCTION },
+    { role: 'user', content: userPrompt }
+  ];
+
   try {
-    const response = await ai.models.generateContent({
-      model: getModelName(),
-      contents: { parts },
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        tools: tools, // Only include search tool if enabled
-        temperature: 0.3, 
-      }
-    });
+    const text = await callOpenAI(messages, config, { temperature: 0.3 });
 
-    // Check for abort after the async operation
     if (signal?.aborted) {
-        throw new Error("Aborted");
+      throw new Error("Aborted");
     }
-
-    const text = response.text || "Analysis generation failed.";
-    const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks as any[];
 
     return {
       markdown: text,
-      groundingChunks: groundingChunks
+      groundingChunks: []
     };
   } catch (error: any) {
     if (signal?.aborted || error.message === "Aborted") {
         throw new Error("Analysis process was stopped by the user.");
     }
-    console.error("Gemini API Error:", error);
+    console.error("OpenAI API Error:", error);
     throw error;
   }
 };
 
-/**
- * Sub-agent to verify paper existence and find the official link.
- */
-const verifyAndFindPaperLink = async (title: string, year: string): Promise<string | undefined> => {
-    const config = getGeminiConfig();
-    if (!config.apiKey) return undefined;
-    const ai = createAIClient();
-
-    // Strict prompt to ensure "Sub-agent" behavior
-    const prompt = `
-      Role: Academic Librarian.
-      Task: Find the official URL for the specific paper: "${title}" (approx. year: ${year}).
-      
-      Steps:
-      1. Search Google for this exact paper title.
-      2. Verify the search result is indeed for the paper "${title}".
-      3. If found, provide the direct link (e.g. arXiv, IEEE Xplore, ACM Digital Library, CVF, etc.).
-      4. If the paper cannot be found or the results are for a different paper, return null.
-
-      Output JSON only: 
-      { 
-        "found": boolean, 
-        "url": "string | null", 
-        "verified_title": "string" 
-      }
-    `;
-
-    try {
-        const response = await ai.models.generateContent({
-            model: getModelName(),
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                tools: [{ googleSearch: {} }],
-                temperature: 0.1 // Very low temp for strict fact checking
-            }
-        });
-        
-        const result = extractJSON(response.text || "{}");
-        if (result && result.found && result.url) {
-            return result.url;
-        }
-        return undefined;
-    } catch (e) {
-        console.error(`Failed to verify link for ${title}`, e);
-        return undefined;
-    }
-};
-
-export const checkPaperTimeliness = async (title: string, authorAndYear: string): Promise<TimelinessReport> => {
-    const config = getGeminiConfig();
+export const checkPaperTimelinessWithOpenAI = async (title: string, authorAndYear: string): Promise<TimelinessReport> => {
+    const config = getApiConfig();
     if (!config.apiKey) throw new Error("API Key missing. Please configure it in Settings.");
-    const ai = createAIClient();
 
-    // Enforce "Latest" paper requirement in prompt
     const prompt = `
         Role: Technical Research Auditor.
         Task: Analyze the timeliness of the paper "${title}" (${authorAndYear}).
@@ -296,48 +198,32 @@ export const checkPaperTimeliness = async (title: string, authorAndYear: string)
     `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: getModelName(),
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                tools: [{ googleSearch: {} }], 
-                temperature: 0.2
-            }
+        const messages = [
+            { role: 'system', content: 'You are a helpful assistant. Output valid JSON only.' },
+            { role: 'user', content: prompt }
+        ];
+        
+        const text = await callOpenAI(messages, config, { 
+            temperature: 0.2,
+            responseFormat: { type: 'json_object' }
         });
         
-        const report = extractJSON(response.text || "{}") as TimelinessReport;
+        const report = extractJSON(text) as TimelinessReport;
         
         if (!report) {
              throw new Error("Failed to parse Timeliness JSON");
         }
 
-        // Phase 2: Sub-agent verification loop
-        if (report.recommendations && report.recommendations.length > 0) {
-            const verifiedRecommendations = await Promise.all(
-                report.recommendations.map(async (rec) => {
-                    const verifiedLink = await verifyAndFindPaperLink(rec.title, rec.year);
-                    return {
-                        ...rec,
-                        link: verifiedLink
-                    };
-                })
-            );
-            report.recommendations = verifiedRecommendations;
-        }
-
-        return report;
-
+        return { ...report, recommendations: report.recommendations?.map(rec => ({ ...rec, link: undefined })) };
     } catch (e) {
         console.error("Timeliness check failed", e);
         return { isOutdated: false, status: "Unknown", summary: "Could not verify timeliness.", recommendations: [] };
     }
 };
 
-export const checkVenueQuality = async (venueText: string): Promise<VenueReport> => {
-    const config = getGeminiConfig();
+export const checkVenueQualityWithOpenAI = async (venueText: string): Promise<VenueReport> => {
+    const config = getApiConfig();
     if (!config.apiKey) throw new Error("API Key missing. Please configure it in Settings.");
-    const ai = createAIClient();
 
     const prompt = `
         Role: Academic Evaluator.
@@ -361,27 +247,26 @@ export const checkVenueQuality = async (venueText: string): Promise<VenueReport>
     `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: getModelName(),
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                tools: [{ googleSearch: {} }],
-                temperature: 0.1
-            }
+        const messages = [
+            { role: 'system', content: 'You are a helpful assistant. Output valid JSON only.' },
+            { role: 'user', content: prompt }
+        ];
+        
+        const text = await callOpenAI(messages, config, { 
+            temperature: 0.1,
+            responseFormat: { type: 'json_object' }
         });
         
-        const report = extractJSON(response.text || "{}");
+        const report = extractJSON(text);
         return report || { name: venueText, type: 'Unknown', quality: 'Unknown', summary: "Could not analyze venue." };
     } catch (e) {
         return { name: venueText, type: 'Unknown', quality: 'Unknown', summary: "Could not analyze venue." };
     }
 };
 
-export const checkAuthorIntegrity = async (authors: string): Promise<IntegrityReport> => {
-    const config = getGeminiConfig();
+export const checkAuthorIntegrityWithOpenAI = async (authors: string): Promise<IntegrityReport> => {
+    const config = getApiConfig();
     if (!config.apiKey) throw new Error("API Key missing. Please configure it in Settings.");
-    const ai = createAIClient();
 
     const prompt = `
         Role: Academic Integrity Officer.
@@ -402,36 +287,33 @@ export const checkAuthorIntegrity = async (authors: string): Promise<IntegrityRe
     `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: getModelName(),
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                tools: [{ googleSearch: {} }],
-                temperature: 0.1
-            }
+        const messages = [
+            { role: 'system', content: 'You are a helpful assistant. Output valid JSON only.' },
+            { role: 'user', content: prompt }
+        ];
+        
+        const text = await callOpenAI(messages, config, { 
+            temperature: 0.1,
+            responseFormat: { type: 'json_object' }
         });
         
-        const report = extractJSON(response.text || "{}");
+        const report = extractJSON(text);
         return report || { hasIssues: false, summary: "Integrity check unavailable." };
     } catch (e) {
         return { hasIssues: false, summary: "Integrity check unavailable." };
     }
 };
 
-export const askFollowUp = async (
-  question: string,
-  originalContext: string,
+export const askFollowUpWithOpenAI = async (
+  question: string, 
+  originalContext: string, 
   history: ChatMessage[]
 ): Promise<string> => {
-  const config = getGeminiConfig();
+  const config = getApiConfig();
   if (!config.apiKey) {
     throw new Error("API Key is missing. Please configure it in Settings.");
   }
 
-  const ai = createAIClient();
-
-  // Construct context from history
   const historyContext = history.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n');
 
   const prompt = `
@@ -462,15 +344,12 @@ export const askFollowUp = async (
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: getModelName(),
-      contents: prompt,
-      config: {
-        temperature: 0.5,
-      }
-    });
+    const messages = [
+        { role: 'system', content: 'You are a helpful research assistant.' },
+        { role: 'user', content: prompt }
+    ];
 
-    const rawText = response.text || "";
+    const rawText = await callOpenAI(messages, config, { temperature: 0.5 });
     
     // Extract content within <final_answer> tags and clean up markdown bolding
     const match = rawText.match(/<final_answer>([\s\S]*?)<\/final_answer>/);
@@ -478,7 +357,7 @@ export const askFollowUp = async (
     if (match && match[1]) {
       return match[1].trim().replace(/\*\*/g, '');
     } else {
-      // Fallback if model fails to tag (rare with high temp, but possible)
+      // Fallback if model fails to tag
       return rawText.replace(/<final_answer>|<\/final_answer>/g, '').replace(/\*\*/g, '').trim();
     }
 
@@ -488,8 +367,8 @@ export const askFollowUp = async (
   }
 };
 
-export const analyzeTrendsWithGemini = async (history: HistoryItem[]): Promise<string> => {
-  const config = getGeminiConfig();
+export const analyzeTrendsWithOpenAI = async (history: HistoryItem[]): Promise<string> => {
+  const config = getApiConfig();
   if (!config.apiKey) {
     throw new Error("API Key is missing. Please configure it in Settings.");
   }
@@ -498,9 +377,6 @@ export const analyzeTrendsWithGemini = async (history: HistoryItem[]): Promise<s
      return "No history available to analyze.";
   }
 
-  const ai = createAIClient();
-
-  // Prepare the context from history
   let aggregatedContext = "";
   
   history.forEach((item, index) => {
@@ -508,7 +384,7 @@ export const analyzeTrendsWithGemini = async (history: HistoryItem[]): Promise<s
     --- PAPER ${index + 1} ---
     Title: ${item.title}
     Analysis Content (Excerpt):
-    ${item.analysis.markdown.substring(0, 1500)}...
+    ${item.analysis?.markdown.substring(0, 1500) || ''}...
     -------------------------
     `;
   });
@@ -558,17 +434,12 @@ export const analyzeTrendsWithGemini = async (history: HistoryItem[]): Promise<s
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: getModelName(),
-      contents: prompt,
-      config: {
-        temperature: 0.3,
-        tools: [{ googleSearch: {} }],
-      }
-    });
+    const messages = [
+        { role: 'system', content: 'You are a helpful research assistant.' },
+        { role: 'user', content: prompt }
+    ];
 
-    return response.text || "Failed to generate trend report.";
-
+    return await callOpenAI(messages, config, { temperature: 0.3, maxTokens: 3000 });
   } catch (error) {
     console.error("Trend Analysis Error:", error);
     throw error;
